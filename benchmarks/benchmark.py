@@ -18,7 +18,9 @@ def run(n: int = 20):
             assert got == body
         rows.append({'payload_bytes':len(payload),'encrypt_ms_median':statistics.median(enc),'decrypt_ms_median':statistics.median(dec),'envelope_bytes':statistics.median(sizes),'roundtrip_ms_median':statistics.median([a+b for a,b in zip(enc,dec)])})
     out=Path(__file__).parent/'results.csv'; out.parent.mkdir(exist_ok=True)
-    with out.open('w',newline='') as f: csv.DictWriter(f,fieldnames=rows[0].keys()).writeheader(); csv.DictWriter(f,fieldnames=rows[0].keys()).writerows(rows)
+    with out.open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys(), lineterminator='\n')
+        writer.writeheader(); writer.writerows(rows)
     make_plot(rows, Path(__file__).parent/'benchmark.png')
     print(json.dumps({'samples':n,'rows':rows}, indent=2))
 
