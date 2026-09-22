@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pqc-a2a"
+version = "0.1.0"
+description = "Hybrid post-quantum authenticated A2A messaging PoC"
+requires-python = ">=3.10"
+dependencies = ["liboqs-python==0.16.0", "cryptography>=50.0.0", "matplotlib>=3.8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
