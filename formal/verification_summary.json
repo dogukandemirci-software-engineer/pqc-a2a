@@ -1,0 +1,17 @@
+{
+  "tool": "TLC 2.19",
+  "model": "Ratchet.tla",
+  "configuration": "Ratchet.cfg",
+  "states_generated": 35,
+  "distinct_states": 32,
+  "states_left_on_queue": 0,
+  "invariant_violations": 0,
+  "complete_graph_depth": 7,
+  "invariants": [
+    "TypeOK",
+    "NoConsumeOnBad",
+    "SingleUse",
+    "ReceiverNeverAhead",
+    "TokenConsistency"
+  ]
+}

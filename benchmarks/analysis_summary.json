@@ -1,0 +1,56 @@
+{
+  "source": "results.csv",
+  "rows": [
+    {
+      "payload_bytes": 256.0,
+      "encrypt_ms_median": 0.8690665,
+      "decrypt_ms_median": 0.5638179999999999,
+      "envelope_bytes": 6650.0,
+      "roundtrip_ms_median": 1.4418039999999999,
+      "absolute_overhead_bytes": 6394.0,
+      "overhead_ratio": 24.9765625,
+      "expansion_factor": 25.9765625,
+      "effective_payload_mib_s": 0.16932996787358062,
+      "encrypt_share": 0.602763274342421,
+      "decrypt_share": 0.3910503785535343,
+      "roundtrip_sum_error_ms": 0.008919499999999969
+    },
+    {
+      "payload_bytes": 4096.0,
+      "encrypt_ms_median": 0.9896495000000001,
+      "decrypt_ms_median": 0.708384,
+      "envelope_bytes": 11770.0,
+      "roundtrip_ms_median": 1.6961585000000001,
+      "absolute_overhead_bytes": 7674.0,
+      "overhead_ratio": 1.87353515625,
+      "expansion_factor": 2.87353515625,
+      "effective_payload_mib_s": 2.3029982162633975,
+      "encrypt_share": 0.5834652245058466,
+      "decrypt_share": 0.4176402146379598,
+      "roundtrip_sum_error_ms": -0.00187499999999996
+    },
+    {
+      "payload_bytes": 16384.0,
+      "encrypt_ms_median": 1.5531395,
+      "decrypt_ms_median": 1.17903,
+      "envelope_bytes": 28154.0,
+      "roundtrip_ms_median": 2.7113825,
+      "absolute_overhead_bytes": 11770.0,
+      "overhead_ratio": 0.7183837890625,
+      "expansion_factor": 1.7183837890625,
+      "effective_payload_mib_s": 5.762742807405447,
+      "encrypt_share": 0.5728219828814267,
+      "decrypt_share": 0.43484458574177565,
+      "roundtrip_sum_error_ms": -0.02078699999999989
+    }
+  ],
+  "checks": {
+    "row_count": 3,
+    "all_positive_latencies": true,
+    "payload_monotonic": true,
+    "roundtrip_monotonic": true,
+    "envelope_monotonic": true,
+    "overhead_positive": true,
+    "roundtrip_median_sum_error_max_ms": 0.02078699999999989
+  }
+}
