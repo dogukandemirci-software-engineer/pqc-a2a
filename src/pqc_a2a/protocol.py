@@ -7,12 +7,15 @@ after authentication and decryption succeed.
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
+from functools import wraps
 import hashlib
 import hmac
 import json
 import os
 from pathlib import Path
 import secrets
+import tempfile
 import threading
 import time
 import uuid
@@ -20,6 +23,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import oqs
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback has no process lock
+    fcntl = None
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
@@ -47,6 +54,56 @@ def canonical(obj: Any) -> bytes:
         return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise ValueError("object is not canonical JSON") from exc
+
+
+@contextmanager
+def _file_lock(path: Path, *, exclusive: bool) -> Any:
+    """Lock a sidecar file so separate worker processes cannot race state IO."""
+    lock_path = Path(str(path) + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as handle:
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_write_json(path: str | os.PathLike[str], value: dict[str, Any]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(value, sort_keys=True, indent=2) + "\n"
+    with _file_lock(target, exclusive=True):
+        fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, target)
+            directory_fd = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def _synchronized(method: Any) -> Any:
+    @wraps(method)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 def _hkdf(secret: bytes, info: bytes, length: int = 32) -> bytes:
@@ -100,18 +157,15 @@ class AgentIdentity:
         public = self.public_record()
         ciphertext = AESGCM(key).encrypt(nonce, canonical(self._record()), canonical(public))
         envelope = {"format": "pqc-a2a-identity/1", "public": public, "salt": b64(salt), "nonce": b64(nonce), "ciphertext": b64(ciphertext)}
-        target = Path(path)
-        target.write_text(json.dumps(envelope, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        try:
-            target.chmod(0o600)
-        except OSError:
-            pass
+        _atomic_write_json(path, envelope)
 
     @classmethod
     def load(cls, path: str | os.PathLike[str], password: str) -> "AgentIdentity":
         if not isinstance(password, str) or len(password) < 12:
             raise ValueError("identity password must contain at least 12 characters")
-        envelope = json.loads(Path(path).read_text(encoding="utf-8"))
+        target = Path(path)
+        with _file_lock(target, exclusive=False):
+            envelope = json.loads(target.read_text(encoding="utf-8"))
         if envelope.get("format") != "pqc-a2a-identity/1":
             raise ValueError("unsupported identity format")
         key = Scrypt(salt=unb64(envelope["salt"]), length=32, n=2**15, r=8, p=1).derive(password.encode("utf-8"))
@@ -178,6 +232,74 @@ class AgentCard:
         return AgentCard(card["name"], tuple(capabilities["kem"]), tuple(capabilities["signatures"]), tuple(capabilities["alpn"]), int(capabilities["max_fragment_size"]), card["version"])
 
 
+def _public_fingerprint(record: dict[str, str]) -> str:
+    return hashlib.sha3_256(canonical(record)).hexdigest()
+
+
+class TrustStore:
+    """Filesystem-backed public-key trust policy for a deployment.
+
+    The store contains public material only. Its file must still be protected
+    because changing it changes who the process trusts. Rotation is authorized
+    by a signature from the currently trusted identity.
+    """
+
+    def __init__(self, trusted: dict[str, dict[str, str]] | None = None, revoked: dict[str, str] | None = None, rotations: list[dict[str, Any]] | None = None) -> None:
+        self.trusted = trusted or {}
+        self.revoked = revoked or {}
+        self.rotations = rotations or []
+        self._lock = threading.RLock()
+
+    def add(self, identity: AgentIdentity, *, replace: bool = False) -> str:
+        with self._lock:
+            if identity.agent_id in self.trusted and not replace and self.trusted[identity.agent_id] != identity.public_record():
+                raise ValueError("agent is already pinned to another public key")
+            record = identity.public_record()
+            fingerprint = _public_fingerprint(record)
+            self.revoked.pop(fingerprint, None)
+            self.trusted[identity.agent_id] = record
+            return fingerprint
+
+    def is_trusted(self, identity: AgentIdentity) -> bool:
+        with self._lock:
+            record = self.trusted.get(identity.agent_id)
+            return record == identity.public_record() and _public_fingerprint(record) not in self.revoked if record else False
+
+    def require_trusted(self, identity: AgentIdentity) -> None:
+        if not self.is_trusted(identity):
+            raise ValueError("identity is not trusted or has been revoked")
+
+    def revoke(self, identity: AgentIdentity, reason: str = "operator revocation") -> None:
+        with self._lock:
+            self.require_trusted(identity)
+            self.revoked[_public_fingerprint(identity.public_record())] = reason
+
+    def rotate(self, old: AgentIdentity, new: AgentIdentity) -> dict[str, Any]:
+        with self._lock:
+            self.require_trusted(old)
+            if old.agent_id != new.agent_id:
+                raise ValueError("rotation must preserve agent_id")
+            body = {"format": "pqc-a2a-rotation/1", "agent_id": old.agent_id, "old": old.public_record(), "new": new.public_record(), "issued_at": int(time.time())}
+            rotation = {**body, "signature": b64(_sign(old, canonical(body)))}
+            self.revoked[_public_fingerprint(old.public_record())] = "replaced by signed rotation"
+            self.trusted[new.agent_id] = new.public_record()
+            self.rotations.append(rotation)
+            return rotation
+
+    def save(self, path: str | os.PathLike[str]) -> None:
+        with self._lock:
+            _atomic_write_json(path, {"format": "pqc-a2a-trust/1", "trusted": self.trusted, "revoked": self.revoked, "rotations": self.rotations})
+
+    @classmethod
+    def load(cls, path: str | os.PathLike[str]) -> "TrustStore":
+        target = Path(path)
+        with _file_lock(target, exclusive=False):
+            value = json.loads(target.read_text(encoding="utf-8"))
+        if value.get("format") != "pqc-a2a-trust/1":
+            raise ValueError("unsupported trust-store format")
+        return cls(dict(value.get("trusted", {})), dict(value.get("revoked", {})), list(value.get("rotations", [])))
+
+
 class ReplayCache:
     def __init__(self, ttl_seconds: float = 300.0):
         if ttl_seconds <= 0:
@@ -223,11 +345,13 @@ def seal(sender: AgentIdentity, recipient: AgentIdentity, payload: dict[str, Any
     return unsigned
 
 
-def open_envelope(recipient: AgentIdentity, sender: AgentIdentity, envelope: dict[str, Any], replay: ReplayCache | None = None) -> dict[str, Any]:
+def open_envelope(recipient: AgentIdentity, sender: AgentIdentity, envelope: dict[str, Any], replay: ReplayCache | None = None, trust_store: TrustStore | None = None) -> dict[str, Any]:
     required = {"version", "message_id", "conversation_id", "sender", "recipient", "kem", "sig", "ephemeral_x25519", "kem_ciphertext", "nonce", "ciphertext", "signature"}
     _check_envelope(envelope, required, 1)
     if envelope["recipient"] != recipient.agent_id or envelope["sender"] != sender.agent_id:
         raise ValueError("identity binding failed")
+    if trust_store is not None:
+        trust_store.require_trusted(sender)
     if envelope["kem"] != recipient.kem_name or envelope["sig"] != sender.sig_name:
         raise ValueError("algorithm binding failed")
     unsigned = {k: v for k, v in envelope.items() if k != "signature"}
@@ -259,8 +383,10 @@ class AsyncKEMRatchet:
             raise ValueError("queue_size cannot be negative")
         self.identity, self.peer, self.chain_key, self.queue = identity, peer, root_key, []
         self.used: set[str] = set()
+        self._lock = threading.RLock()
         self.refill(queue_size)
 
+    @_synchronized
     def refill(self, count: int = 1) -> list[EphemeralKEMToken]:
         if count < 0:
             raise ValueError("count cannot be negative")
@@ -274,6 +400,7 @@ class AsyncKEMRatchet:
         next_chain = _hkdf(self.chain_key + extra, b"pqc-a2a/ratchet/chain")
         return next_chain, _hkdf(next_chain, b"pqc-a2a/ratchet/message")
 
+    @_synchronized
     def seal(self, payload: dict[str, Any], token: EphemeralKEMToken) -> dict[str, Any]:
         if token.token_id in self.used or token.owner_id not in (None, self.peer.agent_id):
             raise ValueError("ephemeral token is not available to this peer")
@@ -288,6 +415,7 @@ class AsyncKEMRatchet:
         self.chain_key, self.used = next_chain, self.used | {token.token_id}
         return out
 
+    @_synchronized
     def open(self, envelope: dict[str, Any], replay: ReplayCache | None = None) -> dict[str, Any]:
         required = {"version", "message_id", "ratchet", "token_id", "sender", "recipient", "kem", "sig", "kem_ciphertext", "nonce", "ciphertext", "signature"}
         _check_envelope(envelope, required, 2)
@@ -312,6 +440,7 @@ class AsyncKEMRatchet:
         token.secret_key = b"\x00" * len(token.secret_key)
         return payload
 
+    @_synchronized
     def save_state(self, path: str | os.PathLike[str], password: str) -> None:
         if not isinstance(password, str) or len(password) < 12:
             raise ValueError("ratchet password must contain at least 12 characters")
@@ -319,17 +448,15 @@ class AsyncKEMRatchet:
         salt, nonce = secrets.token_bytes(16), secrets.token_bytes(12)
         key = Scrypt(salt=salt, length=32, n=2**15, r=8, p=1).derive(password.encode("utf-8"))
         ciphertext = AESGCM(key).encrypt(nonce, canonical(record), b"pqc-a2a-ratchet/1")
-        Path(path).write_text(json.dumps({"format": "pqc-a2a-ratchet/1", "salt": b64(salt), "nonce": b64(nonce), "ciphertext": b64(ciphertext)}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        try:
-            Path(path).chmod(0o600)
-        except OSError:
-            pass
+        _atomic_write_json(path, {"format": "pqc-a2a-ratchet/1", "salt": b64(salt), "nonce": b64(nonce), "ciphertext": b64(ciphertext)})
 
     @classmethod
     def load_state(cls, identity: AgentIdentity, peer: AgentIdentity, path: str | os.PathLike[str], password: str) -> "AsyncKEMRatchet":
         if not isinstance(password, str) or len(password) < 12:
             raise ValueError("ratchet password must contain at least 12 characters")
-        envelope = json.loads(Path(path).read_text(encoding="utf-8"))
+        target = Path(path)
+        with _file_lock(target, exclusive=False):
+            envelope = json.loads(target.read_text(encoding="utf-8"))
         if envelope.get("format") != "pqc-a2a-ratchet/1":
             raise ValueError("unsupported ratchet state format")
         key = Scrypt(salt=unb64(envelope["salt"]), length=32, n=2**15, r=8, p=1).derive(password.encode("utf-8"))
@@ -341,6 +468,7 @@ class AsyncKEMRatchet:
             raise ValueError("ratchet identity binding failed")
         obj = cls.__new__(cls)
         obj.identity, obj.peer = identity, peer
+        obj._lock = threading.RLock()
         obj.chain_key, obj.used = unb64(record["chain_key"]), set(record["used"])
         obj.queue = [EphemeralKEMToken(t["token_id"], unb64(t["public_key"]), unb64(t["secret_key"]), t.get("owner_id")) for t in record["queue"]]
         return obj
@@ -393,4 +521,4 @@ def available_algorithms() -> dict[str, list[str]]:
     return {"kem": list(oqs.get_enabled_kem_mechanisms()), "signature": list(oqs.get_enabled_sig_mechanisms())}
 
 
-__all__ = ["AgentIdentity", "AgentCard", "ReplayCache", "AsyncKEMRatchet", "EphemeralKEMToken", "establish_ratchet", "ArchiveSigner", "seal", "open_envelope", "tamper", "available_algorithms"]
+__all__ = ["AgentIdentity", "AgentCard", "TrustStore", "ReplayCache", "AsyncKEMRatchet", "EphemeralKEMToken", "establish_ratchet", "ArchiveSigner", "seal", "open_envelope", "tamper", "available_algorithms"]

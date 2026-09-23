@@ -8,7 +8,7 @@ Bu depo, otonom ajanlar arasındaki mesajlaşma için **araştırma amaçlı bir
 
 | Alan | Sonuç | Kanıt |
 |---|---:|---|
-| Python testleri | **18 passed** | `pytest -q` |
+| Python testleri | **21 passed** | `pytest -q` |
 | PQC smoke test | **Başarılı** | ML-KEM-768 + ML-DSA-65 + AES-256-GCM |
 | TLA+ invariant kontrolü | **0 ihlal** | 35 üretilen, 32 farklı durum |
 | Veri analizi kontrolleri | **Başarılı** | `benchmarks/analysis_summary.json` |
@@ -26,6 +26,8 @@ Bu tablo, kaynak kodun ve mevcut sonlu modelin doğrulama durumunu özetler. **F
 `AsyncKEMRatchet.save_state()` ve `load_state()` zincir anahtarını, kullanılan token kümesini ve bekleyen token secret’larını parola ile şifrelenmiş bir dosyada saklar. Böylece süreç yeniden başlatıldığında ratchet state’i sıfırlanmaz. State dosyası güvenilir storage üzerinde tutulmalı ve dosya parolası bir secret manager’dan sağlanmalıdır.
 
 `AgentCard.sign()` capability card’ı issuer’ın ML-DSA anahtarıyla imzalar. `AgentCard.verify_signed()` güvenilen issuer identity’si ile imzayı ve issuer bağını doğrular. Discovery kanalının replay, iptal ve trust-store politikası yine uygulamaya aittir.
+
+`TrustStore`, public key pinning, revocation ve eski identity’nin imzaladığı rotation kaydı sağlar. `open_envelope(..., trust_store=store)` kullanıldığında sender identity mesaj doğrulanmadan önce bu politikaya göre kontrol edilir. Identity ve ratchet state dosyaları geçici dosyaya yazılıp `fsync` ve atomic rename ile yer değiştirilir; POSIX sistemlerde ayrı lock dosyası süreçler arası state yarışlarını engeller.
 
 ## Mimari
 
@@ -126,7 +128,7 @@ python3 benchmarks/analyze_results.py
 Beklenen sonuç:
 
 ```text
-18 passed
+21 passed
 ```
 
 PQC kütüphanesi derlenemediğinde test toplama aşamasında hata alınır; bu durum testlerin atlanması anlamına gelmez. Üretimde liboqs sürümü, native build çıktısı ve platform matrisi sabitlenmelidir. TLA+ kontrolü ayrıca [Formal verification: TLA+](#formal-verification-tla) bölümündeki komutla çalıştırılır. Projede Python 3.10–3.12 için hazır bir CI workflow taslağı da bulunur; GitHub Actions’a yüklemek için repository token’ında `workflows` yetkisi etkin olmalıdır.
@@ -159,7 +161,7 @@ Doğrulanan çalışma, **35 durumun tamamında** hata bulmadan tamamlanmıştı
 
 `fragment()` her fragment’ın tamamının MTU sınırına sığmasını sağlar. `reassemble()` sürümü, JSON header’ı, parça aralığını, toplam sayıyı, duplicate index’leri, eksik parçaları ve tam SHA-256 digest’i doğrular. Header içindeki delimiter byte’ları payload’dan ayrıdır; payload içeriği framing’i bozamaz.
 
-Bu yardımcılar tam socket lifecycle, sertifika provisioning, TCP gateway, congestion policy veya durable receive state uygulamaz. QUIC kullanımı gerçek bir bağlantının güvenli olduğu anlamına gelmez; sertifika güven zinciri ve peer identity uygulama tarafından doğru kurulmalıdır.
+Bu yardımcılar tam socket lifecycle, sertifika provisioning, TCP gateway, congestion policy veya durable regular-message replay cache uygulamaz. QUIC kullanımı gerçek bir bağlantının güvenli olduğu anlamına gelmez; sertifika güven zinciri ve peer identity uygulama tarafından doğru kurulmalıdır.
 
 ## Veri analizi ve matematiksel doğrulamalar
 
@@ -254,13 +256,13 @@ Test paketi şu davranışları kapsar:
 
 ## Üretim sınırı ve kalan entegrasyonlar
 
-Kütüphane doğrudan kurulabilir ve test edilebilir bir referans uygulamadır. Aşağıdaki maddeler kütüphane içindeki temel mesajlaşma akışını engellemez; gerçek bir üretim dağıtımında ayrıca yapılandırılması gereken entegrasyon sınırlarıdır:
+Kütüphane doğrudan kurulabilir ve test edilebilir bir referans uygulamasıdır. İlk operasyonel fazda **encrypted atomic persistence**, POSIX süreç kilidi, public-key pinning, revocation ve imzalı key rotation eklenmiştir. Gerçek bir üretim dağıtımında kalan adımlar şunlardır:
 
-1. Agent Card ve public key discovery için imzalı, replay-korumalı ve sertifika doğrulamalı bir kanal.
-2. Kimlik iptali, anahtar rotasyonu, güvenli kalıcı ratchet state ve çoklu süreç eşzamanlama politikası.
-3. Kayıp ve out-of-order mesajlar için bounded skipped-key store ve denial-of-service limitleri.
-4. KMS veya HSM entegrasyonu, secret material yaşam döngüsü ve Python bellek temizleme sınırları.
-5. QUIC sertifika provisioning, hostname/SAN doğrulaması, mutual TLS kararı ve TCP fallback’in gerçek uygulaması.
+1. Agent Card discovery için replay-korumalı kanal, sertifika doğrulaması ve güvenilir trust-store provisioning.
+2. Kayıp ve out-of-order mesajlar için bounded skipped-key store ve denial-of-service limitleri.
+3. KMS veya HSM entegrasyonu, secret material yaşam döngüsü ve Python bellek temizleme sınırları.
+4. QUIC sertifika provisioning, hostname/SAN doğrulaması, mutual TLS kararı ve TCP fallback’in gerçek uygulaması.
+5. Durable regular-message replay cache, operasyonel audit log’ları ve alarm/metric entegrasyonu.
 6. Fuzzing, property-based testing, bağımsız kriptografik protokol incelemesi ve tehdit modelinin operasyonel doğrulaması.
 
 PQC algoritmalarının standardizasyon statüsü ve mekanizma adları liboqs sürümüne bağlıdır. `liboqs-python` ve liboqs sürümü yükseltilmeden önce mekanizma adları, test sonuçları ve benchmark’lar yeniden doğrulanmalıdır.
