@@ -95,6 +95,23 @@ class TcpFallback:
             chunks.append(chunk); remaining -= len(chunk)
         return b"".join(chunks)
 
+    @classmethod
+    def client(cls, sock: socket.socket, *, cafile: str, server_hostname: str, max_frame_size: int = 16 * 1024 * 1024) -> "TcpFallback":
+        if not cafile or not server_hostname: raise ValueError("CA file and server hostname are required")
+        context = ssl.create_default_context(cafile=cafile)
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        return cls(context.wrap_socket(sock, server_hostname=server_hostname), max_frame_size=max_frame_size)
+
+    @classmethod
+    def server(cls, sock: socket.socket, *, certificate: str, private_key: str, cafile: str | None = None, require_client_certificate: bool = False, max_frame_size: int = 16 * 1024 * 1024) -> "TcpFallback":
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        context.load_cert_chain(certificate, private_key)
+        if require_client_certificate:
+            if not cafile: raise ValueError("cafile is required for mutual TLS")
+            context.verify_mode = ssl.CERT_REQUIRED; context.load_verify_locations(cafile)
+        return cls(context.wrap_socket(sock, server_side=True), max_frame_size=max_frame_size)
+
 
 def provision_dev_certificate(directory: str, hostname: str = "localhost") -> tuple[str, str]:
     """Create a short-lived self-signed SAN certificate for local integration tests.

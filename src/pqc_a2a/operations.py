@@ -13,6 +13,7 @@ import os
 import sqlite3
 import threading
 import time
+import secrets
 from pathlib import Path
 from typing import Protocol
 
@@ -104,6 +105,25 @@ class Metrics:
         with self._lock: return dict(self._values)
 
 
+def redact_metadata(value: object, *, sensitive_keys: tuple[str, ...] = ("agent_id", "sender", "recipient", "ip", "url", "endpoint")) -> object:
+    if isinstance(value, dict):
+        return {key: "[redacted]" if key.lower() in sensitive_keys else redact_metadata(item, sensitive_keys=sensitive_keys) for key, item in value.items()}
+    if isinstance(value, list): return [redact_metadata(item, sensitive_keys=sensitive_keys) for item in value]
+    return value
+
+
+def padding_bucket(size: int, buckets: tuple[int, ...] = (256, 1024, 4096, 16384, 65536)) -> int:
+    if size < 0 or not buckets or any(item <= 0 for item in buckets): raise ValueError("invalid padding size")
+    for bucket in buckets:
+        if size <= bucket: return bucket
+    raise ValueError("message exceeds largest padding bucket")
+
+
+def dummy_payload(size: int = 256) -> bytes:
+    if size < 1 or size > 1 << 20: raise ValueError("invalid dummy payload size")
+    return secrets.token_bytes(size)
+
+
 class SkippedKeyStore:
     """Bounded key store for loss/out-of-order session protocols."""
     def __init__(self, max_keys: int = 256, max_bytes: int = 1 << 20):
@@ -127,4 +147,4 @@ class SkippedKeyStore:
     def __len__(self) -> int: return len(self._keys)
 
 
-__all__ = ["SecretProvider", "FileSecretProvider", "best_effort_zeroize", "DurableReplayCache", "AuditLogger", "Metrics", "SkippedKeyStore"]
+__all__ = ["SecretProvider", "FileSecretProvider", "best_effort_zeroize", "DurableReplayCache", "AuditLogger", "Metrics", "redact_metadata", "padding_bucket", "SkippedKeyStore"]

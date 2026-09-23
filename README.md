@@ -171,6 +171,25 @@ Bu yardımcılar tam socket lifecycle, sertifika provisioning, TCP gateway, cong
 
 `TransportProfile.validate_certificate_hostname()` SAN/CN kontrolü yapar, `provision_dev_certificate()` yalnızca yerel entegrasyon testi için kısa ömürlü self-signed sertifika üretir ve `TcpFallback` length-prefixed TLS socket katmanı sağlar. Üretimde CA, sertifika yenileme, KMS/HSM ve mutual TLS politikası deployment tarafından sağlanmalıdır. Ayrıntılı kontrol listesi [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) içindedir.
 
+## P0–P2 secure agent communication
+
+`SessionInitiator` ile uzun ömürlü identity’yi her veri kaydında açığa çıkarmayan, imzalı X25519 handshake ve AES-GCM session kaydı kullanılabilir:
+
+```python
+from pqc_a2a import SessionInitiator
+
+a, b = SessionInitiator(sender_identity, receiver_identity), SessionInitiator(receiver_identity, sender_identity)
+hello = a.hello()
+ack = b.respond(hello)
+a.accept_ack(ack)
+record = a.encrypt({"type": "task.result", "value": 42}, padding_bucket=256)
+assert b.decrypt(record) == {"type": "task.result", "value": 42}
+```
+
+`record` içinde gerçek `agent_id` bulunmaz; yalnızca döndürülebilir opaque handle, session ID, sequence, nonce, ciphertext ve padding bucket bulunur. `ReplayWindow` duplicate ve pencere dışı sequence’leri reddeder. `TcpFallback.client()` / `.server()` fallback’i TLS 1.3 üzerine alır; çıplak `TcpFallback(sock)` yalnızca zaten güvenli bir tunnel içindir.
+
+P1’de `Rendezvous`, `OpaqueRelay` ve kısa ömürlü scoped capability token’lar; ayrıca LangGraph bağımlılığını zorunlu kılmayan `SecureAgentTransport` adaptörü bulunur. P2’de padding bucket, dummy payload ve log metadata redaction yardımcıları vardır. Relay peer IP’sini gizleyebilir, fakat küresel trafik gözlemcisine karşı anonimlik sağlamaz; bunun için gerçek relay/VPN/onion/mixnet topolojisi ve traffic shaping gerekir. Ayrıntılı mimari [`docs/SECURE_AGENT_ARCHITECTURE.md`](docs/SECURE_AGENT_ARCHITECTURE.md) içindedir.
+
 ## Veri analizi ve matematiksel doğrulamalar
 
 Bu bölümdeki sayılar `benchmarks/results.csv` içindeki üç gerçek benchmark satırından türetilir. Her satır hibrit PQC zarfını X25519 + Ed25519 klasik baseline'ı ile karşılaştırır. Yeni bir sonuç üretmek veya eksik gözlemleri tahmin etmek yerine, analiz script’i aynı CSV’yi okuyarak bütün metrikleri yeniden hesaplar:

@@ -24,3 +24,13 @@ The benchmark reports median, p95, sample standard deviation, and a 95% confiden
 This is not a production-ready protocol or a formal security proof. PKI, discovery replay/expiry policy, certificate provisioning, side-channel resistance, memory zeroization guarantees, and durable distributed replay storage remain deployment responsibilities. The cryptographic implementation depends on liboqs and should receive an independent review before production use.
 
 See the Turkish README for the complete project history and examples. The project is released under the MIT License; citation metadata is in `CITATION.cff`.
+
+## Secure agent communication phases
+
+P0 adds `SessionInitiator`: a signed X25519 handshake, transcript-derived AES-GCM session key, rotating opaque handles, sequence numbers, bounded replay windows, and TLS 1.3 wrappers for the TCP fallback. Stable `agent_id` values are not carried in secure data records.
+
+P1 adds scoped short-lived capability tokens, TTL-bound rendezvous records, bounded opaque relay queues, and a LangGraph-compatible `SecureAgentTransport` adapter that does not require LangGraph as an installation dependency.
+
+P2 adds padding buckets, application-managed dummy payloads, and metadata redaction helpers. These reduce metadata leakage but do not claim global anonymity: hiding IP addresses requires an actual relay/VPN/onion/mixnet topology, and strong traffic-analysis resistance requires shaping and cover traffic.
+
+See [`docs/SECURE_AGENT_ARCHITECTURE.md`](docs/SECURE_AGENT_ARCHITECTURE.md) for the deployment boundary and threat model.
