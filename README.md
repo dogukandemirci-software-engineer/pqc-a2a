@@ -1,304 +1,232 @@
-# PQC-A2A: Hibrit Post-Quantum Agent-to-Agent Kütüphanesi
+# PQC-A2A
 
-Bu depo, otonom ajanlar arasındaki mesajlaşma için **araştırma amaçlı bir hibrit PQC prototipidir**. ML-KEM-768 ile X25519 birlikte kullanılır. Mesaj kimlik doğrulaması ML-DSA-65 ile yapılır. İçerik AES-256-GCM ile şifrelenir. QUIC profili TLS 1.3 ve `pqc-a2a/1` ALPN değerini kullanır. Uzun süreli manifest doğrulaması için SLH-DSA-SHA2-128s desteklenir.
+**PQC-A2A**, AI ajanları arasında kimlik doğrulamalı ve hibrit post-quantum güvenlikli mesajlaşma için Python kütüphanesidir. Proje; **ML-KEM-768 + X25519** ile anahtar anlaşması, **ML-DSA-65** ile imza, **AES-256-GCM** ile veri gizliliği ve replay/state kontrolleri etrafında yapılandırılmıştır.
 
-> **Güvenlik sonucu:** Bu sürüm, önceki uygulamadaki doğrulama sonrası state ilerlemesi, zayıf fragment doğrulaması ve varsayılan güvensiz QUIC peer doğrulaması sorunlarını düzeltir. Şifreli identity/ratchet state, imzalı capability card ve CI doğrulaması eklenmiştir. Buna rağmen proje bağımsız bir güvenlik değerlendirmesinden geçmemiştir; üretimde kullanılmadan önce bu README’nin üretim sınırları bölümü tamamlanmalıdır.
+> **Durum:** Güvenlik hardening ve regression testleri uygulanmış production adayı bir temel. PKI/CA, KMS/HSM, dağıtık replay storage, sertifika rotasyonu ve bağımsız kriptografik protokol incelemesi hâlâ deployment sorumluluğudur. Bu proje formal güvenlik ispatı veya anonimlik çözümü iddiasında değildir.
 
-## Doğrulama durumu
+[English README](README.en.md) · [Threat model](docs/THREAT_MODEL.md) · [Secure architecture](docs/SECURE_AGENT_ARCHITECTURE.md) · [Protocol architecture source](docs/protocol_architecture.mmd)
 
-| Alan | Sonuç | Kanıt |
-|---|---:|---|
-| Python testleri | **23 passed** | `pytest -q` |
-| PQC smoke test | **Başarılı** | ML-KEM-768 + ML-DSA-65 + AES-256-GCM |
-| TLA+ invariant kontrolü | **0 ihlal** | 35 üretilen, 32 farklı durum |
-| Veri analizi kontrolleri | **Başarılı** | `benchmarks/analysis_summary.json` |
+## Öne çıkan özellikler
 
-Bu tablo, kaynak kodun ve mevcut sonlu modelin doğrulama durumunu özetler. **Formal doğrulama sonucu algoritmaların, liboqs’nin veya işletim sisteminin güvenliğini kanıtlamaz.**
+| Katman | Sağlanan kontrol |
+| --- | --- |
+| Hibrit anahtar anlaşması | ML-KEM-768 ile X25519 ortak secret’ının transcript-bound HKDF ile türetilmesi |
+| Mesaj kimlik doğrulaması | ML-DSA-65 imzası, canonical JSON ve algorithm binding |
+| Veri gizliliği | AES-256-GCM; metadata AAD içinde doğrulanır |
+| Mesaj yaşam döngüsü | `issued_at`, `expires_at`, clock-skew politikası ve replay cache |
+| Session kanalı | İmzalı X25519 hello/ack, opaque handle, sequence ve bounded replay window |
+| Ratchet | One-time ephemeral KEM token’ları, bounded queue, state persistence ve başarısız decrypt sonrası state koruması |
+| Kimlik ve güven | Signed Agent Card, discovery challenge/TTL, trust-store pinning ve key rotation yapı taşları |
+| Transport | QUIC/TLS 1.3 profili, TLS TCP fallback ve MTU-aware fragmentation |
+| Relay | Opaque handle routing, scoped capability token, TTL-bound rendezvous ve bounded queue |
+| Operasyon | Durable SQLite replay cache, audit event hook, metrics hook, skipped-key limitleri |
+| A2A uyumluluğu | Transport-neutral Agent Card ve JSON-RPC 2.0 request/result yardımcıları |
 
-## Uygulanan güvenlik modeli
+## Protokol mimarisi
 
-`seal()` her mesaj için yeni bir mesaj kimliği, X25519 ephemeral anahtarı, ML-KEM ciphertext’i ve AES-GCM nonce üretir. ML-KEM paylaşılan sırrı ile X25519 sırrı uzunluk önekli birleştirme sonrasında, algoritmaları, kimlikleri, public key'leri, ephemeral key'i ve KEM ciphertext'ini içeren transcript'e bağlı HKDF-SHA3-256 ile anahtara dönüştürülür. `issued_at` ve `expires_at` alanları imzalıdır ve zaman penceresi dışında mesaj kabul edilmez. Algoritma kimlikleri, gönderen, alıcı, konuşma kimliği, mesaj kimliği ve zaman penceresi hem AEAD AAD içinde hem de ML-DSA imzasının kapsamındadır.
+Aşağıdaki şema discovery’den session handshake’e, şifreli envelope’dan transport/relay katmanına kadar ana veri akışını gösterir. Kesikli oklar ratchet ve formal modelin secure channel ile ilişkisini gösterir.
 
-`open_envelope()` önce envelope sürümünü, kimlik bağını ve algoritma bağını doğrular. Ardından imzayı doğrular ve AEAD çözme işlemini tamamlar. Replay cache’e mesaj ancak bu adımlar başarılı olduktan sonra eklenir. Böylece sahte veya bozuk bir mesaj geçerli mesaj kimliğini zehirleyemez.
+![PQC-A2A protokol mimarisi](docs/protocol_architecture.png)
 
-`AsyncKEMRatchet`, alıcının önceden ürettiği tek kullanımlık ML-KEM token’larını kullanır. Gönderici ve alıcı zincir anahtarını yalnızca başarılı şifreleme veya başarılı imzalı çözme sonrasında ilerletir. Başarısız imza, KEM decapsulation veya AES-GCM doğrulaması token’ı tüketmez ve zinciri ilerletmez. Token tüketimi tek kullanımlıdır. Kayıp ve sıra dışı teslim için skipped-key store bu prototipte yoktur.
+Şemanın kaynak dosyası [`docs/protocol_architecture.mmd`](docs/protocol_architecture.mmd) içindedir.
 
-`AsyncKEMRatchet.save_state()` ve `load_state()` zincir anahtarını, kullanılan token kümesini ve bekleyen token secret’larını parola ile şifrelenmiş bir dosyada saklar. Böylece süreç yeniden başlatıldığında ratchet state’i sıfırlanmaz. State dosyası güvenilir storage üzerinde tutulmalı ve dosya parolası bir secret manager’dan sağlanmalıdır.
+### Mesaj akışı
 
-`AgentCard.sign()` capability card’ı issuer’ın ML-DSA anahtarıyla imzalar. `AgentCard.verify_signed()` güvenilen issuer identity’si ile imzayı ve issuer bağını doğrular. Discovery kanalının replay, iptal ve trust-store politikası yine uygulamaya aittir.
+1. **Identity ve Agent Card:** Ajan ML-KEM, ML-DSA ve X25519 public material’ı üretir. Agent Card signing identity ile imzalanır.
+2. **Trust ve discovery:** Discovery kaydı challenge, geçerlilik aralığı ve imza ile doğrulanır. Trust store deployment tarafından sabitlenen anchor/pin politikasını taşır.
+3. **Session handshake:** Taraflar kısa ömürlü X25519 anahtarlarıyla signed hello/ack değiştirir. Session key handshake transcript’ine bağlanır.
+4. **Secure record:** Payload AES-256-GCM ile korunur. `session_id`, recipient handle, sequence ve padding bucket AAD olarak bağlanır.
+5. **Protocol envelope:** Tekil mesajlarda ML-KEM ciphertext, ephemeral X25519 public key, nonce, ciphertext ve ML-DSA signature birlikte taşınır.
+6. **Transport ve relay:** QUIC veya TLS 1.3 TCP fallback kullanılabilir. Relay yalnızca opaque handle ve secure record görmelidir.
+7. **Receiver commit:** Receiver signature ve AEAD doğrulamasını tamamlamadan replay window state’ini ilerletmez.
 
-`TrustStore`, public key pinning, revocation ve eski identity’nin imzaladığı rotation kaydı sağlar. `open_envelope(..., trust_store=store)` kullanıldığında sender identity mesaj doğrulanmadan önce bu politikaya göre kontrol edilir. Identity ve ratchet state dosyaları geçici dosyaya yazılıp `fsync` ve atomic rename ile yer değiştirilir; POSIX sistemlerde ayrı lock dosyası süreçler arası state yarışlarını engeller.
+## Kurulum
 
-## Mimari
-
-```text
-Agent Card A  <---- capability negotiation; discovery authentication kapsam dışı ---->  Agent Card B
-     |                                                                                |
-     |  Receiver: one-time ML-KEM token queue                                        |
-     |  Sender: one token per message                                                |
-     |  ML-KEM shared secret + chain key -> HKDF-SHA3-256 message key                 |
-     |  AES-256-GCM payload + ML-DSA-65 signature                                    |
-     |                                                                                |
-     +--------------------------- QUIC / TLS 1.3 / ALPN pqc-a2a/1 ------------------+
-                             strict application fragmentation
-
-Long-lived manifest ------------------------------------> SLH-DSA-SHA2-128s
-```
-
-## Developer quickstart
-
-Ubuntu’da ilk kurulumdan önce liboqs derleme araçlarını kurun. Hazır ve güvenilir bir liboqs paketi kullanan dağıtımlarda bu adım paket yöneticisinin kurallarına göre değişebilir:
+Python 3.10 veya üzeri ve native `liboqs` build ortamı gerekir. Ubuntu için:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y cmake ninja-build build-essential libssl-dev
-```
-
-Kaynak depodan doğrudan kurulum:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -U pip
-python -m pip install 'pqc-a2a[dev] @ git+https://github.com/dogukandemirci-software-engineer/pqc-a2a.git'
-pqc-a2a doctor
-```
-
-Yerel geliştirme için:
-
-```bash
+sudo apt-get install -y --no-install-recommends cmake ninja-build libssl-dev
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
-pytest -q
-python examples/quickstart.py
 ```
 
-`pqc-a2a doctor`, liboqs’nin ML-KEM-768, ML-DSA-65 ve SLH-DSA mekanizmalarını açabildiğini kontrol eder. Kimlik oluşturmak için parola komutu kullanılabilir:
+Native backend’i doğrulayın:
 
 ```bash
-pqc-a2a identity-create agent-a agent-a.identity.json
+python -c "from pqc_a2a import available_algorithms; print(available_algorithms())"
 ```
 
-Özel anahtarlar düz JSON olarak yazılmaz. `AgentIdentity.save()` ve `AgentIdentity.load()` scrypt ile parola türetir, ardından AES-256-GCM ile identity kaydını şifreler. Parola minimum 12 karakterdir ve identity dosyası mümkün olduğunda `0600` izinleriyle oluşturulur.
+Beklenen katalogda en az `ML-KEM-768` ve `ML-DSA-65` bulunmalıdır. `liboqs-python`, Python wrapper’a ek olarak native shared library gerektirir; yalnızca `pip install` ile tamamlanan ortamlarda testler başlamayabilir.
 
-Mesajlaşmanın en kısa Python örneği:
+## Hızlı başlangıç
 
 ```python
 from pqc_a2a import AgentIdentity, ReplayCache, open_envelope, seal
 
 sender = AgentIdentity("agent-a")
-recipient = AgentIdentity("agent-b")
-envelope = seal(sender, recipient, {"type": "task.result", "value": 42})
-message = open_envelope(recipient, sender, envelope, ReplayCache())
-assert message["value"] == 42
+receiver = AgentIdentity("agent-b")
+replay = ReplayCache(ttl_seconds=300)
+
+envelope = seal(
+    sender,
+    receiver,
+    {"method": "summarize", "input": "post-quantum message"},
+    ttl_seconds=300,
+)
+
+payload = open_envelope(receiver, sender, envelope, replay=replay)
+assert payload["method"] == "summarize"
 ```
 
-`examples/quickstart.py`, bu akışın şifreli identity dosyasıyla tekrar başlatılabilen sürümüdür.
-
-### İki sahte model ajanının encrypted streaming demosu
-
-`examples/encrypted_agents_stream.py`, gerçek bir model API’sine bağlanmadan iki deterministik sahte ajanı çalıştırır: `gpt-sim` ve `gemma-sim`. Her ajan kendi ML-KEM/ML-DSA identity’sini üretir, imzalı capability card yayınlar ve dört boyutlu sabit bir embedding metadata’sı ile selamlaşır. Embedding değerleri yalnızca test verisidir; model çıktısı veya kriptografik anahtar değildir.
-
-Mesaj envelope’ları 180 byte MTU ile fragment edilir, asynchronous queue üzerinden frame frame taşınır ve alıcıda `reassemble()` sonrası gerçek `open_envelope()` ile doğrulanır:
-
-```bash
-PYTHONPATH=src python examples/encrypted_agents_stream.py \
-  --frame-delay-ms 0.2 --mtu 180
-```
-
-Başarılı çalışmada her iki yön için `status: "ok"`, karşı tarafın model adı ve 153 fragment görülür. Aynı senaryo `tests/test_encrypted_agents_stream.py` içinde otomatik test edilir:
-
-```bash
-pytest tests/test_encrypted_agents_stream.py -q
-```
-
-## Kurulum ve test
-
-Ubuntu üzerinde liboqs-python ilk PQC çağrısında liboqs derleyebilir. Güvenilir kurulum için aşağıdaki native bağımlılıklar gerekir:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y cmake ninja-build build-essential libssl-dev
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
-pytest -q
-python3 benchmarks/analyze_results.py
-```
-
-Beklenen sonuç:
-
-```text
-23 passed
-```
-
-PQC kütüphanesi derlenemediğinde test toplama aşamasında hata alınır; bu durum testlerin atlanması anlamına gelmez. Üretimde liboqs sürümü, native build çıktısı ve platform matrisi sabitlenmelidir. TLA+ kontrolü ayrıca [Formal verification: TLA+](#formal-verification-tla) bölümündeki komutla çalıştırılır. Projede Python 3.10–3.12 için hazır bir CI workflow taslağı da bulunur; GitHub Actions’a yüklemek için repository token’ında `workflows` yetkisi etkin olmalıdır.
-
-## Formal verification: TLA+
-
-`formal/Ratchet.tla`, asenkron KEM ratchet’ın soyut state machine modelidir. Model şu özellikleri ifade eder:
-
-- Başarısız açma denemesi token state’ini değiştirmez.
-- Başarılı açma bir token’ı yalnızca bir kez tüketir.
-- Alıcı zinciri gönderici zincirinin önüne geçmez.
-- Tüketilmiş token’lar açılmış token kümesinde bulunur.
-
-`formal/Ratchet.cfg`, iki token ve sonlu başarısız deneme sınırıyla sonlu bir durum uzayı tanımlar. Bu sınır, TLC’nin model-checking işlemini tekrarlanabilir kılar; gerçek uygulamanın mesaj sayısını sınırlayan bir güvenlik iddiası değildir.
-
-TLC çalıştırmak için resmi `tla2tools.jar` dosyasını indirip ortam değişkenini ayarlayın:
-
-```bash
-mkdir -p .tools
-curl -L --fail -o .tools/tla2tools.jar \
-  https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
-TLA2TOOLS_JAR="$PWD/.tools/tla2tools.jar" bash formal/run_tlc.sh
-```
-
-Doğrulanan çalışma, **35 durumun tamamında** hata bulmadan tamamlanmıştır. Bu model kriptografik primitiflerin güvenliğini, liboqs uygulamasını, anahtar yönetimini, sertifika zincirini veya Python bellek temizliğini kanıtlamaz. TLA+ sonucu yalnızca modellenen protocol-state invariants için geçerlidir. Sonuçlar [makine-okunabilir özet](formal/verification_summary.json) ve [grafik](formal/verification.png) olarak da saklanır.
-
-## Transport ve fragmentation
-
-`TransportProfile.client_configuration()` artık TLS peer doğrulamasını `ssl.CERT_REQUIRED` olarak kurar. Gerçek istemci bağlantısında güvenilir CA dosyası (`cafile`) ve uygun `server_name` verilmelidir. Sertifika doğrulamasını kapatmak için bir seçenek sunulmaz. Sunucu tarafında istemci sertifikası varsayılan olarak zorunlu değildir; karşılıklı TLS gerektiğinde `require_client_certificate=True` kullanılmalıdır.
-
-`fragment()` her fragment’ın tamamının MTU sınırına sığmasını sağlar. `reassemble()` sürümü, JSON header’ı, parça aralığını, toplam sayıyı, duplicate index’leri, eksik parçaları ve tam SHA-256 digest’i doğrular. Header içindeki delimiter byte’ları payload’dan ayrıdır; payload içeriği framing’i bozamaz.
-
-Bu yardımcılar tam socket lifecycle, sertifika provisioning, TCP gateway, congestion policy veya durable regular-message replay cache uygulamaz. QUIC kullanımı gerçek bir bağlantının güvenli olduğu anlamına gelmez; sertifika güven zinciri ve peer identity uygulama tarafından doğru kurulmalıdır.
-
-### Operasyonel hardening yardımcıları
-
-`make_discovery_record()` ve `verify_discovery_record()`, Agent Card discovery yanıtını challenge, imzalı zaman penceresi ve replay cache ile bağlar. `provision_trust_store_from_discovery()` yalnızca önceden güvenilen anchor kimliğinin imzaladığı discovery kaydından pin ekler; bu otomatik PKI değildir.
-
-`DurableReplayCache` SQLite üzerinde atomic replay kabulü ve TTL temizliği yapar. `AuditLogger` ve `Metrics` başarılı envelope açma olaylarını uygulamanın log/metric sistemine bağlamak için hook sağlar. `SkippedKeyStore`, kayıp ve out-of-order session anahtarları için anahtar/adet/boyut sınırı uygular. `FileSecretProvider` ve `best_effort_zeroize()` KMS/HSM entegrasyonunun yerini tutmaz; Python immutable `bytes` değerlerinin güvenilir biçimde temizlenemeyeceği kabul edilmelidir.
-
-`TransportProfile.validate_certificate_hostname()` SAN/CN kontrolü yapar, `provision_dev_certificate()` yalnızca yerel entegrasyon testi için kısa ömürlü self-signed sertifika üretir ve `TcpFallback` length-prefixed TLS socket katmanı sağlar. Üretimde CA, sertifika yenileme, KMS/HSM ve mutual TLS politikası deployment tarafından sağlanmalıdır. Ayrıntılı kontrol listesi [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) içindedir.
-
-## P0–P2 secure agent communication
-
-`SessionInitiator` ile uzun ömürlü identity’yi her veri kaydında açığa çıkarmayan, imzalı X25519 handshake ve AES-GCM session kaydı kullanılabilir:
+Identity ve ratchet state dosyaları scrypt + AES-GCM ile password-protected saklanabilir:
 
 ```python
-from pqc_a2a import SessionInitiator
-
-a, b = SessionInitiator(sender_identity, receiver_identity), SessionInitiator(receiver_identity, sender_identity)
-hello = a.hello()
-ack = b.respond(hello)
-a.accept_ack(ack)
-record = a.encrypt({"type": "task.result", "value": 42}, padding_bucket=256)
-assert b.decrypt(record) == {"type": "task.result", "value": 42}
+identity.save("agent.identity.json", password="a-long-development-password")
+restored = AgentIdentity.load("agent.identity.json", password="a-long-development-password")
 ```
 
-`record` içinde gerçek `agent_id` bulunmaz; yalnızca döndürülebilir opaque handle, session ID, sequence, nonce, ciphertext ve padding bucket bulunur. `ReplayWindow` duplicate ve pencere dışı sequence’leri reddeder. `TcpFallback.client()` / `.server()` fallback’i TLS 1.3 üzerine alır; çıplak `TcpFallback(sock)` yalnızca zaten güvenli bir tunnel içindir.
+Bu dosya tabanlı şifreleme KMS/HSM yerine geçmez. Production deployment’ta password’lerin kaynak kodda veya düz environment variable içinde tutulmaması gerekir.
 
-P1’de `Rendezvous`, `OpaqueRelay` ve kısa ömürlü scoped capability token’lar; ayrıca LangGraph bağımlılığını zorunlu kılmayan `SecureAgentTransport` adaptörü bulunur. P2’de padding bucket, dummy payload ve log metadata redaction yardımcıları vardır. Relay peer IP’sini gizleyebilir, fakat küresel trafik gözlemcisine karşı anonimlik sağlamaz; bunun için gerçek relay/VPN/onion/mixnet topolojisi ve traffic shaping gerekir. Ayrıntılı mimari [`docs/SECURE_AGENT_ARCHITECTURE.md`](docs/SECURE_AGENT_ARCHITECTURE.md) içindedir.
+## Production güvenlik modeli
 
-## Veri analizi ve matematiksel doğrulamalar
+| Korunan varlık | Kütüphane kontrolü | Deployment sorumluluğu |
+| --- | --- | --- |
+| Mesaj gizliliği | ML-KEM/X25519 hybrid derivation + AES-GCM | Anahtarların KMS/HSM’de tutulması ve rotation |
+| Mesaj bütünlüğü | ML-DSA signature + AES-GCM authentication tag | Trusted identity/public-key dağıtımı |
+| Replay | In-memory veya durable replay backend | HA storage, backup/restore ve retention |
+| Session replay | Bounded replay window; authentication sonrası commit | Session persistence ve failover politikası |
+| Agent Card sahteciliği | Signed card + trust-store pinning | Root anchor, revocation ve monitoring |
+| Transport peer | TLS 1.3, CA verification, opsiyonel mTLS | CA issuance, renewal, SAN/EKU ve network policy |
+| Metadata | Opaque handle ve padding bucket yardımcıları | Relay/VPN/mixnet topolojisi ve traffic shaping |
+| Secret storage | Password-protected identity/ratchet formats | KMS/HSM, access control, memory/process isolation |
 
-Bu bölümdeki sayılar `benchmarks/results.csv` içindeki üç gerçek benchmark satırından türetilir. Her satır hibrit PQC zarfını X25519 + Ed25519 klasik baseline'ı ile karşılaştırır. Yeni bir sonuç üretmek veya eksik gözlemleri tahmin etmek yerine, analiz script’i aynı CSV’yi okuyarak bütün metrikleri yeniden hesaplar:
+> **Önemli sınır:** Şifreleme tek başına IP adresini, timing’i, bağlantı süresini veya trafik hacmini gizlemez. Global passive observer’a karşı anonymity, unlinkability veya güçlü traffic-analysis resistance iddiası yoktur.
+
+## Hardening durumu
+
+Son hardening commit’inde (`fcb6c17`) aşağıdaki production riskleri kapatıldı veya sınırlandırıldı:
+
+- Failed secure-channel ciphertext’inin replay window’u ilerletmesi engellendi.
+- `DurableReplayCache(":memory:")` bağlantılar arasında state kaybetmeyecek şekilde düzeltildi.
+- Rendezvous registration, capability token subject handle’ına bağlandı.
+- Capability expiry ve scope tip kontrolleri sıkılaştırıldı.
+- Fragment reassembly için fragment count, total byte, message-id ve digest format limitleri eklendi.
+- Dosya secret provider’ın plaintext-at-rest semantiği açık hale getirildi; atomic write ve `fsync` eklendi.
+- Replay, capability ownership ve forged-high-sequence senaryoları için regression testleri eklendi.
+
+Bu hardening bağımsız bir kriptografik incelemenin yerini tutmaz.
+
+## Benchmark ve ölçümler
+
+Sonuçlar repository içindeki `benchmarks/results.csv` ve `benchmarks/analysis_summary.json` dosyalarından üretilmiştir. Her veri noktası **20 örneğe** dayanır. Sonuçlar belirli bir ortamın ölçümüdür; donanım sıralaması veya genel throughput garantisi değildir.
+
+![PQC-A2A benchmark ve formal doğrulama dashboard'u](benchmarks/readme_metrics.png)
+
+### Temel ölçümler
+
+| Payload | PQC envelope | Klasik envelope | PQC round-trip median | PQC seal p95 | PQC open p95 | Klasik round-trip median | PQC/klasik latency |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 B | 6,674 B | 348 B | 0.985 ms | 0.835 ms | 0.517 ms | 0.220 ms | 4.48× |
+| 4 KiB | 11,794 B | 4,188 B | 1.272 ms | 0.939 ms | 0.594 ms | 0.247 ms | 5.15× |
+| 16 KiB | 28,178 B | 16,476 B | 2.131 ms | 1.461 ms | 1.033 ms | 0.332 ms | 6.41× |
+
+| Payload | PQC absolute overhead | Klasik absolute overhead | PQC expansion | Klasik expansion | PQC round-trip CI95 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 B | 6,418 B | 92 B | 26.07× | 1.36× | ±0.101 ms |
+| 4 KiB | 7,698 B | 92 B | 2.88× | 1.02× | ±0.047 ms |
+| 16 KiB | 11,794 B | 92 B | 1.72× | 1.01× | ±0.069 ms |
+
+### Ölçümlerin yorumu
+
+PQC envelope boyutu özellikle küçük payload’larda sabit kriptografik metadata nedeniyle büyüktür. 256 B payload için envelope expansion factor **26.07×**, 4 KiB için **2.88×**, 16 KiB için **1.72×** ölçülmüştür. Klasik baseline expansion factor aynı sırayla **1.36×**, **1.02×** ve **1.01×** seviyesindedir.
+
+Hybrid PQC round-trip median değeri payload büyüdükçe **0.985 ms’den 2.131 ms’ye** çıkmıştır. Bu ölçüm, ML-KEM/ML-DSA implementation’ının ve serialization maliyetinin küçük mesajlarda baskın olabileceğini gösterir. Production kapasite planı için hedef CPU mimarisinde yeni benchmark alınmalıdır.
+
+95% confidence interval half-width değerleri PQC için sırasıyla **0.101 ms**, **0.047 ms** ve **0.069 ms**; klasik baseline için **0.020 ms**, **0.007 ms** ve **0.015 ms** olarak raporlanmıştır. Bu aralıklar ölçüm belirsizliğini gösterir; protokolün güvenlik olasılığı değildir.
+
+Benchmark’ı yeniden üretmek için:
 
 ```bash
-python3 benchmarks/analyze_results.py
+python benchmarks/benchmark.py 50
+python benchmarks/analyze_results.py
+python benchmarks/generate_readme_assets.py
 ```
 
-Script `benchmarks/analysis_summary.json` ve `benchmarks/analysis.png` dosyalarını üretir. Ham benchmark ayrıca p95, örnek standart sapma ve analizde %95 güven aralığı üretir; grafik PQC/classical round-trip, envelope genişlemesi ve güven aralığını karşılaştırır.
+`benchmarks/benchmark.png` temel seal/open latency ve wire overhead’i, `benchmarks/analysis.png` baseline karşılaştırmasını, `benchmarks/readme_metrics.png` ise genişletilmiş dashboard’u gösterir.
 
-![Benchmark verisinden türetilen gecikme, overhead ve throughput metrikleri](benchmarks/analysis.png)
+## Formal model kapsamı
 
-Her satır için kullanılan denklemler şöyledir. `P` payload byte sayısını, `E` envelope byte sayısını, `T` round-trip süresini, `S` seal süresini ve `O` open süresini gösterir:
+Ratchet state machine’i `formal/Ratchet.tla` ve `formal/Ratchet.cfg` ile TLC 2.19 üzerinde finite-state olarak kontrol edilmiştir.
+
+| TLC metriği | Değer |
+| --- | ---: |
+| Üretilen state | 35 |
+| Distinct state | 32 |
+| Queue’da kalan state | 0 |
+| Complete graph depth | 7 |
+| Invariant violation | 0 |
+| Kontrol edilen invariant | 5 |
+
+Kontrol edilen invariant’lar: `TypeOK`, `NoConsumeOnBad`, `SingleUse`, `ReceiverNeverAhead` ve `TokenConsistency`.
+
+![TLA+ / TLC finite-state verification](formal/verification.png)
+
+Bu sonuç yalnızca belirtilen finite-state model için geçerlidir. ML-KEM, ML-DSA, AES-GCM, liboqs veya Python runtime’ın matematiksel güvenliğini kanıtlamaz. `0 invariant violations` gerçek dünyada sıfır güvenlik açığı anlamına gelmez.
+
+## Test ve kalite kontrolleri
+
+Yerel validation sonucunda:
 
 ```text
-mutlak overhead       = E - P
-overhead oranı        = (E - P) / P
-envelope genişlemesi  = E / P
-etkin throughput      = P / (T / 1000) / 2^20  MiB/s
-medyan tutarlılık hatası = T - S - O
+39 passed
+Ruff F/E9 source checks: passed
+Bandit source scan: passed
+pip-audit: no known vulnerabilities
+compileall: passed
+git diff --check: passed
 ```
 
-### Hesaplanan benchmark metrikleri
+Test suite envelope, replay, ratchet, signed Agent Card, discovery, trust-store, TLS/TCP framing, fragmentation, session handshake, opaque relay, capability ve operational hardening senaryolarını kapsar.
 
-| Payload | Envelope | Overhead | Overhead oranı | Genişleme | Round-trip | Etkin throughput |
-|---:|---:|---:|---:|---:|---:|---:|
-| 256 B | 6.650 B | 6.394 B | %2.497,7 | 25,98× | 1,442 ms | 0,169 MiB/s |
-| 4 KiB | 11.770 B | 7.674 B | %187,4 | 2,87× | 1,696 ms | 2,303 MiB/s |
-| 16 KiB | 28.154 B | 11.770 B | %71,8 | 1,718× | 2,711 ms | 5,763 MiB/s |
-
-Bu sonuç iki önemli mühendislik etkisini gösterir. Birincisi, sabit boyutlu PQC public-key/ciphertext ve imza alanları küçük payload’larda baskın olduğundan 256 B mesajın envelope’u payload’ın yaklaşık 26 katıdır. İkincisi, payload büyüdükçe sabit kriptografik overhead amorti olur; bu nedenle mutlak overhead 6.394 B’den 11.770 B’ye çıkmasına rağmen overhead oranı %2.497,7’den %71,8’e iner.
-
-### Veri tutarlılığı kontrolleri
-
-Analiz script’i aşağıdaki sonlu veri kontrollerini de yapar:
-
-| Kontrol | Sonuç |
-|---|---:|
-| Gözlem satırı sayısı | 3 |
-| Tüm round-trip süreleri pozitif | `true` |
-| Payload boyutları monoton artıyor | `true` |
-| Round-trip süreleri monoton artıyor | `true` |
-| Envelope boyutları monoton artıyor | `true` |
-| Tüm overhead değerleri pozitif | `true` |
-| `|T - S - O|` maksimumu | 0,020787 ms |
-
-Son satır için önemli bir metodolojik sınır vardır: benchmark, `T` değerini her örnekte `S + O` olarak ölçse de medyanlar bağımsız olarak alındığı için genel olarak `median(S + O) = median(S) + median(O)` eşitliği beklenmez. Bu nedenle 0,020787 ms fark bir kriptografik doğrulama değil, ölçüm tutarlılığı göstergesidir.
-
-### TLA+ durum uzayı verisi
-
-TLA+ doğrulaması `formal/verification_summary.json` içinde makinece okunabilir biçimde saklanır. TLC 2.19, `Ratchet.cfg` ile sonlu modelin 35 durumunu üretmiş, 32 farklı durumu ziyaret etmiş ve kuyruğu sıfıra indirmiştir. Beş değişmezden hiçbirinde ihlal bulunmamıştır.
-
-![TLA+ finite-state doğrulama özeti](formal/verification.png)
-
-| Formal metrik | Değer |
-|---|---:|
-| Üretilen durum | 35 |
-| Farklı durum | 32 |
-| Durum deduplikasyon oranı, `32 / 35` | %91,43 |
-| Tamamlanan grafik derinliği | 7 |
-| Arama kuyruğunda kalan durum | 0 |
-| Kontrol edilen değişmez | 5 |
-| Değişmez ihlali | 0 |
-
-Buradaki `0 / 5 = %0` ihlal oranı, yalnızca sonlu modeldeki beş mantıksal özelliğin ihlal edilmediğini gösterir. Bu sonuç ML-KEM, ML-DSA, AES-GCM veya liboqs implementasyonlarının matematiksel güvenliğini kanıtlamaz. Aynı şekilde `32 / 35` oranı bir güvenlik olasılığı değildir; TLC’nin ürettiği durumların ne kadarının birbirinden farklı olduğunu gösteren bir raporlama metriğidir. Formal iddia, aşağıdaki değişmezlerle sınırlıdır:
+## Dizin yapısı
 
 ```text
-TypeOK              : bütün değişkenler tanımlı sonlu tiplerde
-NoConsumeOnBad     : başarısız açma token state’ini değiştirmez
-SingleUse           : açılmış token sayısı başarılı açma sayısına eşittir
-ReceiverNeverAhead  : receiver_chain <= sender_chain
-TokenConsistency   : consumed token, opened kümesinde bulunur
+src/pqc_a2a/
+├── protocol.py          # Identity, envelopes, trust, replay, ratchet
+├── secure_channel.py    # Session hello/ack, secure records, replay window
+├── transport.py         # QUIC/TLS, TCP fallback, fragmentation
+├── discovery.py         # Signed discovery records
+├── relay.py             # Capabilities, rendezvous, opaque relay
+├── operations.py        # Persistence, audit, metrics, limits
+├── a2a.py               # Agent Card ve JSON-RPC adapter
+└── langgraph_adapter.py # Optional LangGraph-compatible transport
+
+tests/                   # Protocol, fuzz-like ve regression testleri
+benchmarks/              # Benchmark, analysis ve README dashboard scriptleri
+formal/                  # TLA+ model, TLC config ve verification output
+docs/                    # Threat model, architecture ve diagram source
 ```
 
-Dolayısıyla benchmark bölümü **ölçümsel kanıt**, TLA+ bölümü ise modellenen state machine için **durum-uzayı kanıtı** sunar. İki sonuç da bağımsız güvenlik denetiminin veya kriptografik ispatın yerine geçmez.
+## Release öncesi checklist
 
-## Test kapsamı
+- KMS/HSM-backed secret provider ve key rotation runbook’u.
+- Gerçek CA/SPIFFE/SPIRE trust plane, certificate renewal ve revocation.
+- Durable replay DB backup/restore, crash recovery ve multi-process testleri.
+- Rate limiting, connection timeout, queue backpressure ve telemetry.
+- Adversarial fuzzing; özellikle handshake replay, fragment memory pressure ve malformed schema input’ları.
+- Hedef CPU/OS/Python matrisi üzerinde native liboqs build ve benchmark.
+- Bağımsız cryptographic protocol review ve security disclosure süreci.
 
-Test paketi şu davranışları kapsar:
+## Lisans ve referanslar
 
-- Hibrit envelope round-trip, replay rejection, ciphertext tampering ve identity binding.
-- ML-KEM ratchet token tüketimi, zincir ilerlemesi, replay ve başarısız çözmede state rollback.
-- Archive signer imzası, algoritma alanı ve manifest digest doğrulaması.
-- MTU sınırı, delimiter byte’ları, sıra dışı fragment teslimi, duplicate ve out-of-range rejection.
-- TLS client peer verification ayarı.
-- Agent Card negotiation ve QUIC ALPN ayarı.
-- Şifreli identity persistence, yanlış parola reddi ve public/private key eşleşmesi.
-- İmzalı capability card doğrulaması ve tamper reddi.
-- Şifreli ratchet state persistence ve süreç yeniden başlatma sonrası mesajlaşma.
-- Statik embedding metadata taşıyan sahte GPT/Gemma ajanlarının asynchronous fragmented stream üzerinden karşılıklı selamlaşması.
+Proje MIT License ile yayımlanır. Citation metadata [`CITATION.cff`](CITATION.cff) içindedir.
 
-## Üretim sınırı ve kalan entegrasyonlar
-
-Kütüphane doğrudan kurulabilir ve test edilebilir bir referans uygulamasıdır. İlk operasyonel fazda **encrypted atomic persistence**, POSIX süreç kilidi, public-key pinning, revocation ve imzalı key rotation eklenmiştir. Gerçek bir üretim dağıtımında kalan adımlar şunlardır:
-
-1. Agent Card discovery için replay-korumalı kanal, sertifika doğrulaması ve güvenilir trust-store provisioning.
-2. Kayıp ve out-of-order mesajlar için bounded skipped-key store ve denial-of-service limitleri.
-3. KMS veya HSM entegrasyonu, secret material yaşam döngüsü ve Python bellek temizleme sınırları.
-4. QUIC sertifika provisioning, hostname/SAN doğrulaması, mutual TLS kararı ve TCP fallback’in gerçek uygulaması.
-5. Durable regular-message replay cache, operasyonel audit log’ları ve alarm/metric entegrasyonu.
-6. Fuzzing, property-based testing, bağımsız kriptografik protokol incelemesi ve tehdit modelinin operasyonel doğrulaması.
-
-PQC algoritmalarının standardizasyon statüsü ve mekanizma adları liboqs sürümüne bağlıdır. `liboqs-python` ve liboqs sürümü yükseltilmeden önce mekanizma adları, test sonuçları ve benchmark’lar yeniden doğrulanmalıdır.
-
-## Kaynaklar
-
-[1]: https://csrc.nist.gov/pubs/fips/203/final "FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard"
-[2]: https://csrc.nist.gov/pubs/fips/204/final "FIPS 204: Module-Lattice-Based Digital Signature Standard"
-[3]: https://github.com/open-quantum-safe/liboqs-python "liboqs-python bindings"
+[1]: https://csrc.nist.gov/pubs/fips/203/final "NIST FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard"
+[2]: https://csrc.nist.gov/pubs/fips/204/final "NIST FIPS 204: Module-Lattice-Based Digital Signature Standard"
+[3]: https://cryptography.io/en/latest/hazmat/primitives/aead/ "cryptography AEAD primitives"
 [4]: https://github.com/open-quantum-safe/liboqs "Open Quantum Safe liboqs"
 [5]: https://github.com/aiortc/aioquic "aioquic QUIC and HTTP/3 implementation"
 [6]: https://lamport.azurewebsites.net/tla/tla.html "The TLA+ Specification Language and Tools"
