@@ -1,20 +1,15 @@
-"""Analyze benchmark results without generating or imputing observations.
-
-Usage: python benchmarks/analyze_results.py
-Outputs analysis_summary.json and analysis.png next to results.csv.
-"""
+"""Analyze raw hybrid-PQC versus classical baseline benchmark results."""
 from __future__ import annotations
 
 import csv
 import json
+import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).parent
-INPUT = ROOT / "results.csv"
-SUMMARY = ROOT / "analysis_summary.json"
-PLOT = ROOT / "analysis.png"
+INPUT, SUMMARY, PLOT = ROOT / "results.csv", ROOT / "analysis_summary.json", ROOT / "analysis.png"
 
 
 def load_rows() -> list[dict[str, float]]:
@@ -22,67 +17,53 @@ def load_rows() -> list[dict[str, float]]:
         return [{key: float(value) for key, value in row.items()} for row in csv.DictReader(handle)]
 
 
+def ci95(stdev: float, samples: float) -> float:
+    return 1.96 * stdev / math.sqrt(samples) if samples > 1 else 0.0
+
+
 def analyze(rows: list[dict[str, float]]) -> dict:
     derived = []
     for row in rows:
-        payload = row["payload_bytes"]
-        envelope = row["envelope_bytes"]
-        roundtrip = row["roundtrip_ms_median"]
-        encrypt = row["encrypt_ms_median"]
-        decrypt = row["decrypt_ms_median"]
-        derived.append({
+        samples = row.get("samples", 50.0)
+        item = {
             **row,
-            "absolute_overhead_bytes": envelope - payload,
-            "overhead_ratio": (envelope - payload) / payload,
-            "expansion_factor": envelope / payload,
-            "effective_payload_mib_s": payload / (roundtrip / 1000) / (1024 * 1024),
-            "encrypt_share": encrypt / roundtrip,
-            "decrypt_share": decrypt / roundtrip,
-            "roundtrip_sum_error_ms": roundtrip - encrypt - decrypt,
-        })
-
-    def monotonic(values: list[float]) -> bool:
-        return all(left <= right for left, right in zip(values, values[1:]))
-
+            "pqc_absolute_overhead_bytes": row["pqc_envelope_bytes"] - row["payload_bytes"],
+            "classical_absolute_overhead_bytes": row["classical_envelope_bytes"] - row["payload_bytes"],
+            "pqc_expansion_factor": row["pqc_envelope_bytes"] / row["payload_bytes"],
+            "classical_expansion_factor": row["classical_envelope_bytes"] / row["payload_bytes"],
+            "pqc_vs_classical_latency_ratio": row["pqc_roundtrip_median_ms"] / row["classical_roundtrip_median_ms"],
+            "pqc_roundtrip_ci95_ms": ci95(row.get("pqc_roundtrip_stdev_ms", 0), samples),
+            "classical_roundtrip_ci95_ms": ci95(row.get("classical_roundtrip_stdev_ms", 0), samples),
+        }
+        derived.append(item)
+    monotonic = lambda values: all(a <= b for a, b in zip(values, values[1:]))
     checks = {
         "row_count": len(rows),
-        "all_positive_latencies": all(r["roundtrip_ms_median"] > 0 for r in rows),
+        "all_positive_latencies": all(r["pqc_roundtrip_median_ms"] > 0 and r["classical_roundtrip_median_ms"] > 0 for r in rows),
         "payload_monotonic": monotonic([r["payload_bytes"] for r in rows]),
-        "roundtrip_monotonic": monotonic([r["roundtrip_ms_median"] for r in rows]),
-        "envelope_monotonic": monotonic([r["envelope_bytes"] for r in rows]),
-        "overhead_positive": all(r["absolute_overhead_bytes"] > 0 for r in derived),
-        "roundtrip_median_sum_error_max_ms": max(abs(r["roundtrip_sum_error_ms"]) for r in derived),
+        "pqc_envelope_monotonic": monotonic([r["pqc_envelope_bytes"] for r in rows]),
+        "classical_envelope_monotonic": monotonic([r["classical_envelope_bytes"] for r in rows]),
+        "pqc_overhead_positive": all(r["pqc_absolute_overhead_bytes"] > 0 for r in derived),
+        "classical_overhead_positive": all(r["classical_absolute_overhead_bytes"] > 0 for r in derived),
     }
-    return {"source": str(INPUT.name), "rows": derived, "checks": checks}
+    return {"source": INPUT.name, "method": "median, p95, sample standard deviation, 95% normal CI", "rows": derived, "checks": checks}
 
 
 def make_plot(result: dict) -> None:
     rows = result["rows"]
-    x = [r["payload_bytes"] for r in rows]
-    labels = [f"{int(v / 1024)} KiB" if v >= 1024 else f"{int(v)} B" for v in x]
-    plt.style.use("seaborn-v0_8-whitegrid")
+    labels = [f"{int(r['payload_bytes'] / 1024)} KiB" if r["payload_bytes"] >= 1024 else f"{int(r['payload_bytes'])} B" for r in rows]
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.6), constrained_layout=True)
-
-    axes[0].plot(labels, [r["encrypt_ms_median"] for r in rows], "o-", label="Seal")
-    axes[0].plot(labels, [r["decrypt_ms_median"] for r in rows], "o-", label="Open")
-    axes[0].plot(labels, [r["roundtrip_ms_median"] for r in rows], "o-", label="Round-trip")
-    axes[0].set_title("Medyan gecikme")
-    axes[0].set_ylabel("ms")
-    axes[0].legend()
-
-    axes[1].bar(labels, [r["absolute_overhead_bytes"] for r in rows], color="#c44e52")
-    axes[1].set_title("Envelope overhead")
-    axes[1].set_ylabel("byte")
-    for index, row in enumerate(rows):
-        axes[1].text(index, row["absolute_overhead_bytes"], f"{row['overhead_ratio']:.1%}", ha="center", va="bottom", fontsize=9)
-
-    axes[2].plot(labels, [r["effective_payload_mib_s"] for r in rows], "o-", color="#4c72b0")
-    axes[2].set_title("Effective payload throughput")
-    axes[2].set_ylabel("MiB/s")
-
-    fig.suptitle("PQC-A2A: ham benchmark verisinden türetilen metrikler")
-    fig.savefig(PLOT, dpi=180)
-    plt.close(fig)
+    axes[0].plot(labels, [r["pqc_roundtrip_median_ms"] for r in rows], "o-", label="Hybrid PQC")
+    axes[0].plot(labels, [r["classical_roundtrip_median_ms"] for r in rows], "o-", label="X25519 + Ed25519")
+    axes[0].set_title("Round-trip median"); axes[0].set_ylabel("ms"); axes[0].legend()
+    axes[1].bar(labels, [r["pqc_expansion_factor"] for r in rows], label="PQC")
+    axes[1].plot(labels, [r["classical_expansion_factor"] for r in rows], "o-", color="#4c72b0", label="Classical")
+    axes[1].set_title("Envelope expansion"); axes[1].set_ylabel("factor"); axes[1].legend()
+    axes[2].plot(labels, [r["pqc_roundtrip_ci95_ms"] for r in rows], "o-", label="PQC CI95")
+    axes[2].plot(labels, [r["classical_roundtrip_ci95_ms"] for r in rows], "o-", label="Classical CI95")
+    axes[2].set_title("95% confidence interval"); axes[2].set_ylabel("ms"); axes[2].legend()
+    fig.suptitle("PQC-A2A: hybrid and classical baseline")
+    fig.savefig(PLOT, dpi=180); plt.close(fig)
 
 
 if __name__ == "__main__":

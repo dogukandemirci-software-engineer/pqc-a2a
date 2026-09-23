@@ -110,11 +110,14 @@ def _hkdf(secret: bytes, info: bytes, length: int = 32) -> bytes:
     return HKDF(algorithm=hashes.SHA3_256(), length=length, salt=None, info=info).derive(secret)
 
 
-def _derive_secret(pqc_secret: bytes, classical_secret: bytes, context: bytes) -> bytes:
+def _derive_secret(pqc_secret: bytes, classical_secret: bytes, context: bytes, transcript: bytes = b"") -> bytes:
     # Length-prefixing prevents ambiguity if an implementation ever changes
     # one of the component secret lengths.
     ikm = len(pqc_secret).to_bytes(2, "big") + pqc_secret + len(classical_secret).to_bytes(2, "big") + classical_secret
-    return _hkdf(ikm, b"pqc-a2a/v1/hybrid/" + context)
+    # Bind the KDF to the complete negotiated transcript.  This prevents a
+    # ciphertext/public-key substitution from producing the same message key.
+    transcript_hash = hashlib.sha3_256(transcript).digest()
+    return _hkdf(ikm + len(transcript_hash).to_bytes(2, "big") + transcript_hash, b"pqc-a2a/v1/hybrid/" + context)
 
 
 @dataclass
@@ -331,22 +334,27 @@ def _check_envelope(envelope: dict[str, Any], required: set[str], version: int) 
             raise ValueError("invalid envelope identity field")
 
 
-def seal(sender: AgentIdentity, recipient: AgentIdentity, payload: dict[str, Any], *, conversation_id: str | None = None) -> dict[str, Any]:
+def seal(sender: AgentIdentity, recipient: AgentIdentity, payload: dict[str, Any], *, conversation_id: str | None = None, ttl_seconds: int = 300, issued_at: int | None = None) -> dict[str, Any]:
+    if ttl_seconds <= 0 or ttl_seconds > 86400:
+        raise ValueError("ttl_seconds must be between 1 and 86400")
     message_id, conversation_id = str(uuid.uuid4()), conversation_id or str(uuid.uuid4())
-    aad_obj = {"version": 1, "message_id": message_id, "conversation_id": conversation_id, "sender": sender.agent_id, "recipient": recipient.agent_id, "kem": sender.kem_name, "sig": sender.sig_name}
+    issued_at = int(time.time()) if issued_at is None else int(issued_at)
+    aad_obj = {"version": 1, "message_id": message_id, "conversation_id": conversation_id, "sender": sender.agent_id, "recipient": recipient.agent_id, "kem": sender.kem_name, "sig": sender.sig_name, "issued_at": issued_at, "expires_at": issued_at + ttl_seconds}
     with oqs.KeyEncapsulation(recipient.kem_name) as kem:
         kem_ct, pqc_secret = kem.encap_secret(recipient.kem_public)
     x_eph = X25519PrivateKey.generate()
     classical_secret = x_eph.exchange(X25519PublicKey.from_public_bytes(recipient.x_public))
-    key = _derive_secret(pqc_secret, classical_secret, conversation_id.encode())
-    unsigned = {**aad_obj, "ephemeral_x25519": b64(x_eph.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)), "kem_ciphertext": b64(kem_ct), "nonce": b64(secrets.token_bytes(12))}
+    ephemeral_public = x_eph.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    transcript = canonical({"aad": aad_obj, "recipient_kem_public": b64(recipient.kem_public), "recipient_x_public": b64(recipient.x_public), "ephemeral_x25519": b64(ephemeral_public), "kem_ciphertext": b64(kem_ct)})
+    key = _derive_secret(pqc_secret, classical_secret, conversation_id.encode(), transcript)
+    unsigned = {**aad_obj, "ephemeral_x25519": b64(ephemeral_public), "kem_ciphertext": b64(kem_ct), "nonce": b64(secrets.token_bytes(12))}
     unsigned["ciphertext"] = b64(AESGCM(key).encrypt(unb64(unsigned["nonce"]), canonical(payload), canonical(aad_obj)))
     unsigned["signature"] = b64(_sign(sender, canonical(unsigned)))
     return unsigned
 
 
-def open_envelope(recipient: AgentIdentity, sender: AgentIdentity, envelope: dict[str, Any], replay: ReplayCache | None = None, trust_store: TrustStore | None = None) -> dict[str, Any]:
-    required = {"version", "message_id", "conversation_id", "sender", "recipient", "kem", "sig", "ephemeral_x25519", "kem_ciphertext", "nonce", "ciphertext", "signature"}
+def open_envelope(recipient: AgentIdentity, sender: AgentIdentity, envelope: dict[str, Any], replay: ReplayCache | None = None, trust_store: TrustStore | None = None, *, now: int | None = None, clock_skew: int = 30) -> dict[str, Any]:
+    required = {"version", "message_id", "conversation_id", "sender", "recipient", "kem", "sig", "issued_at", "expires_at", "ephemeral_x25519", "kem_ciphertext", "nonce", "ciphertext", "signature"}
     _check_envelope(envelope, required, 1)
     if envelope["recipient"] != recipient.agent_id or envelope["sender"] != sender.agent_id:
         raise ValueError("identity binding failed")
@@ -354,6 +362,11 @@ def open_envelope(recipient: AgentIdentity, sender: AgentIdentity, envelope: dic
         trust_store.require_trusted(sender)
     if envelope["kem"] != recipient.kem_name or envelope["sig"] != sender.sig_name:
         raise ValueError("algorithm binding failed")
+    if not isinstance(envelope["issued_at"], int) or not isinstance(envelope["expires_at"], int) or envelope["expires_at"] <= envelope["issued_at"]:
+        raise ValueError("invalid message validity window")
+    now = int(time.time()) if now is None else int(now)
+    if now < envelope["issued_at"] - clock_skew or now > envelope["expires_at"] + clock_skew:
+        raise ValueError("message expired or not yet valid")
     unsigned = {k: v for k, v in envelope.items() if k != "signature"}
     with oqs.Signature(sender.sig_name) as sig:
         if not sig.verify(canonical(unsigned), unb64(envelope["signature"]), sender.sig_public):
@@ -361,8 +374,9 @@ def open_envelope(recipient: AgentIdentity, sender: AgentIdentity, envelope: dic
     with oqs.KeyEncapsulation(recipient.kem_name, secret_key=recipient.kem_secret) as kem:
         pqc_secret = kem.decap_secret(unb64(envelope["kem_ciphertext"]))
     classical_secret = recipient.x_private.exchange(X25519PublicKey.from_public_bytes(unb64(envelope["ephemeral_x25519"])))
-    key = _derive_secret(pqc_secret, classical_secret, envelope["conversation_id"].encode())
-    aad = canonical({k: envelope[k] for k in ("version", "message_id", "conversation_id", "sender", "recipient", "kem", "sig")})
+    transcript = canonical({"aad": {k: envelope[k] for k in ("version", "message_id", "conversation_id", "sender", "recipient", "kem", "sig", "issued_at", "expires_at")}, "recipient_kem_public": b64(recipient.kem_public), "recipient_x_public": b64(recipient.x_public), "ephemeral_x25519": envelope["ephemeral_x25519"], "kem_ciphertext": envelope["kem_ciphertext"]})
+    key = _derive_secret(pqc_secret, classical_secret, envelope["conversation_id"].encode(), transcript)
+    aad = canonical({k: envelope[k] for k in ("version", "message_id", "conversation_id", "sender", "recipient", "kem", "sig", "issued_at", "expires_at")})
     payload = json.loads(AESGCM(key).decrypt(unb64(envelope["nonce"]), unb64(envelope["ciphertext"]), aad))
     if replay is not None and not replay.accept(envelope["message_id"]):
         raise ValueError("replay detected")

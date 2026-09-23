@@ -8,7 +8,7 @@ Bu depo, otonom ajanlar arasındaki mesajlaşma için **araştırma amaçlı bir
 
 | Alan | Sonuç | Kanıt |
 |---|---:|---|
-| Python testleri | **21 passed** | `pytest -q` |
+| Python testleri | **23 passed** | `pytest -q` |
 | PQC smoke test | **Başarılı** | ML-KEM-768 + ML-DSA-65 + AES-256-GCM |
 | TLA+ invariant kontrolü | **0 ihlal** | 35 üretilen, 32 farklı durum |
 | Veri analizi kontrolleri | **Başarılı** | `benchmarks/analysis_summary.json` |
@@ -17,7 +17,7 @@ Bu tablo, kaynak kodun ve mevcut sonlu modelin doğrulama durumunu özetler. **F
 
 ## Uygulanan güvenlik modeli
 
-`seal()` her mesaj için yeni bir mesaj kimliği, X25519 ephemeral anahtarı, ML-KEM ciphertext’i ve AES-GCM nonce üretir. ML-KEM paylaşılan sırrı ile X25519 sırrı uzunluk önekli birleştirme sonrasında HKDF-SHA3-256 ile anahtara dönüştürülür. Algoritma kimlikleri, gönderen, alıcı, konuşma kimliği ve mesaj kimliği hem AEAD AAD içinde hem de ML-DSA imzasının kapsamındadır.
+`seal()` her mesaj için yeni bir mesaj kimliği, X25519 ephemeral anahtarı, ML-KEM ciphertext’i ve AES-GCM nonce üretir. ML-KEM paylaşılan sırrı ile X25519 sırrı uzunluk önekli birleştirme sonrasında, algoritmaları, kimlikleri, public key'leri, ephemeral key'i ve KEM ciphertext'ini içeren transcript'e bağlı HKDF-SHA3-256 ile anahtara dönüştürülür. `issued_at` ve `expires_at` alanları imzalıdır ve zaman penceresi dışında mesaj kabul edilmez. Algoritma kimlikleri, gönderen, alıcı, konuşma kimliği, mesaj kimliği ve zaman penceresi hem AEAD AAD içinde hem de ML-DSA imzasının kapsamındadır.
 
 `open_envelope()` önce envelope sürümünü, kimlik bağını ve algoritma bağını doğrular. Ardından imzayı doğrular ve AEAD çözme işlemini tamamlar. Replay cache’e mesaj ancak bu adımlar başarılı olduktan sonra eklenir. Böylece sahte veya bozuk bir mesaj geçerli mesaj kimliğini zehirleyemez.
 
@@ -128,7 +128,7 @@ python3 benchmarks/analyze_results.py
 Beklenen sonuç:
 
 ```text
-21 passed
+23 passed
 ```
 
 PQC kütüphanesi derlenemediğinde test toplama aşamasında hata alınır; bu durum testlerin atlanması anlamına gelmez. Üretimde liboqs sürümü, native build çıktısı ve platform matrisi sabitlenmelidir. TLA+ kontrolü ayrıca [Formal verification: TLA+](#formal-verification-tla) bölümündeki komutla çalıştırılır. Projede Python 3.10–3.12 için hazır bir CI workflow taslağı da bulunur; GitHub Actions’a yüklemek için repository token’ında `workflows` yetkisi etkin olmalıdır.
@@ -165,13 +165,13 @@ Bu yardımcılar tam socket lifecycle, sertifika provisioning, TCP gateway, cong
 
 ## Veri analizi ve matematiksel doğrulamalar
 
-Bu bölümdeki sayılar `benchmarks/results.csv` içindeki üç gerçek benchmark satırından türetilir. Yeni bir sonuç üretmek veya eksik gözlemleri tahmin etmek yerine, analiz script’i aynı CSV’yi okuyarak bütün metrikleri yeniden hesaplar:
+Bu bölümdeki sayılar `benchmarks/results.csv` içindeki üç gerçek benchmark satırından türetilir. Her satır hibrit PQC zarfını X25519 + Ed25519 klasik baseline'ı ile karşılaştırır. Yeni bir sonuç üretmek veya eksik gözlemleri tahmin etmek yerine, analiz script’i aynı CSV’yi okuyarak bütün metrikleri yeniden hesaplar:
 
 ```bash
 python3 benchmarks/analyze_results.py
 ```
 
-Script `benchmarks/analysis_summary.json` ve `benchmarks/analysis.png` dosyalarını üretir. Grafik, medyan seal/open/round-trip gecikmesini, mutlak envelope overhead’ını ve etkin payload throughput’unu birlikte gösterir.
+Script `benchmarks/analysis_summary.json` ve `benchmarks/analysis.png` dosyalarını üretir. Ham benchmark ayrıca p95, örnek standart sapma ve analizde %95 güven aralığı üretir; grafik PQC/classical round-trip, envelope genişlemesi ve güven aralığını karşılaştırır.
 
 ![Benchmark verisinden türetilen gecikme, overhead ve throughput metrikleri](benchmarks/analysis.png)
 
