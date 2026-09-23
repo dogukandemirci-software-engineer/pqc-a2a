@@ -3,7 +3,7 @@ import ssl
 
 import pytest
 
-from pqc_a2a import AgentIdentity, ReplayCache, TransportProfile, fragment, reassemble, open_envelope, seal
+from pqc_a2a import AgentIdentity, DurableReplayCache, ReplayCache, Rendezvous, TransportProfile, fragment, reassemble, open_envelope, seal
 
 
 def test_failed_decryption_does_not_advance_ratchet_or_consume_token():
@@ -66,3 +66,32 @@ def test_archive_digest_and_algorithm_are_verified():
 def test_tls_client_does_not_default_to_insecure_peer_acceptance():
     config = TransportProfile().client_configuration()
     assert config.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_durable_memory_replay_cache_persists_between_operations():
+    cache = DurableReplayCache(":memory:")
+    assert cache.accept("first")
+    assert not cache.accept("first")
+
+
+def test_rendezvous_rejects_capability_for_different_handle():
+    identity = AgentIdentity("rendezvous-owner")
+    capability = __import__("pqc_a2a").issue_capability(identity, audience="rendezvous", scopes=("register",), ttl_seconds=300, epoch=0)
+    rendezvous = Rendezvous(replay_cache=DurableReplayCache(":memory:"))
+    with pytest.raises(ValueError, match="subject"):
+        rendezvous.register("not-the-token-subject", "https://private.invalid", capability, identity, now=100)
+
+
+def test_secure_channel_failed_authentication_does_not_advance_window():
+    from pqc_a2a import SessionInitiator
+    sender, receiver = AgentIdentity("window-a"), AgentIdentity("window-b")
+    client = SessionInitiator(sender, receiver, handle_epoch=0)
+    server = SessionInitiator(receiver, sender, handle_epoch=0)
+    hello = client.hello(issued_at=100)
+    client.accept_ack(server.respond(hello, issued_at=101))
+    record = client.encrypt({"ok": True})
+    forged = dict(record)
+    forged["sequence"] = 100000
+    with pytest.raises(ValueError):
+        server.decrypt(forged)
+    assert server.decrypt(record) == {"ok": True}

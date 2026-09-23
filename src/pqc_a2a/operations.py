@@ -6,7 +6,6 @@ logging, metrics, or the secret provider with their own infrastructure.
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -25,7 +24,13 @@ class SecretProvider(Protocol):
 
 
 class FileSecretProvider:
-    """Minimal encrypted-storage boundary; use a KMS/HSM adapter in production."""
+    """Filesystem secret provider with explicit plaintext-at-rest semantics.
+
+    This class is intentionally not marketed as encrypted storage. Production
+    deployments should provide a KMS/HSM-backed implementation of
+    :class:`SecretProvider`; this provider is suitable only for controlled
+    development or hosts where the filesystem itself is trusted.
+    """
     def __init__(self, root: str | os.PathLike[str]):
         self.root = Path(root); self.root.mkdir(parents=True, exist_ok=True)
         os.chmod(self.root, 0o700)
@@ -44,9 +49,26 @@ class FileSecretProvider:
         if not isinstance(value, bytes) or not value:
             raise ValueError("secret must be non-empty bytes")
         path = self._path(name)
-        temporary = path.with_suffix(".tmp")
+        temporary = path.with_name(f".{path.name}.tmp")
         with self._lock:
-            temporary.write_bytes(value); os.chmod(temporary, 0o600); os.replace(temporary, path)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            fd = os.open(temporary, flags, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(value)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+                directory_fd = os.open(self.root, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
 
     def destroy(self, name: str) -> None:
         with self._lock:
@@ -68,13 +90,18 @@ class DurableReplayCache:
         if ttl_seconds <= 0 or max_entries < 1: raise ValueError("invalid replay limits")
         self.path, self.ttl_seconds, self.max_entries = str(path), ttl_seconds, max_entries
         self._lock = threading.RLock()
+        self._memory_db = self.path == ":memory:"
+        self._db = sqlite3.connect(":memory:", timeout=5, isolation_level="IMMEDIATE") if self._memory_db else None
         with self._connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS replay (message_id TEXT PRIMARY KEY, seen_at REAL NOT NULL)")
             db.commit()
 
     def _connect(self):
+        if self._db is not None:
+            return self._db
         db = sqlite3.connect(self.path, timeout=5, isolation_level="IMMEDIATE")
         db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
         return db
 
     def accept(self, message_id: str, now: float | None = None) -> bool:

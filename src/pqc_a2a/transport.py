@@ -170,9 +170,21 @@ def fragment(payload: bytes, mtu: int = 1200, message_id: str = "", max_fragment
     return frames
 
 
-def reassemble(fragments: Iterable[bytes], max_fragments: int = 4096) -> bytes:
-    parts = list(fragments)
-    if not parts or len(parts) > max_fragments:
+def reassemble(fragments: Iterable[bytes], max_fragments: int = 4096, max_total_bytes: int = 64 * 1024 * 1024) -> bytes:
+    if max_fragments < 1 or max_total_bytes < 1:
+        raise ValueError("invalid reassembly limits")
+    parts = []
+    total_bytes = 0
+    for raw in fragments:
+        if not isinstance(raw, bytes) or not raw:
+            raise ValueError("invalid fragment")
+        if len(raw) > max_total_bytes or total_bytes + len(raw) > max_total_bytes:
+            raise ValueError("fragment set exceeds byte limit")
+        parts.append(raw)
+        total_bytes += len(raw)
+        if len(parts) > max_fragments:
+            raise ValueError("invalid fragment set")
+    if not parts:
         raise ValueError("invalid fragment set")
     parsed = []
     for raw in parts:
@@ -185,9 +197,9 @@ def reassemble(fragments: Iterable[bytes], max_fragments: int = 4096) -> bytes:
             mid, index, total, digest = header["id"], header["i"], header["n"], header["h"]
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             raise ValueError("malformed fragment") from exc
-        if not isinstance(mid, str) or not isinstance(index, int) or isinstance(index, bool) or not isinstance(total, int) or isinstance(total, bool) or not isinstance(digest, str):
+        if not isinstance(mid, str) or len(mid) > 256 or not isinstance(index, int) or isinstance(index, bool) or not isinstance(total, int) or isinstance(total, bool) or not isinstance(digest, str):
             raise ValueError("invalid fragment header")
-        if total < 1 or total > max_fragments or index < 0 or index >= total or len(digest) != 64:
+        if total < 1 or total > max_fragments or index < 0 or index >= total or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest.lower()):
             raise ValueError("invalid fragment range")
         parsed.append((mid, index, total, digest, body))
     mids, totals, digests = {x[0] for x in parsed}, {x[2] for x in parsed}, {x[3] for x in parsed}

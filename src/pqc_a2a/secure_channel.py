@@ -6,8 +6,9 @@ records. Stable AgentIdentity values remain inside the authenticated handshake.
 from __future__ import annotations
 
 import hashlib
-import hmac
+import json
 import secrets
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -72,6 +73,16 @@ class ReplayWindow:
         self._seen = {item for item in self._seen if item > self.highest - self.window}
         return True
 
+    def can_accept(self, sequence: int) -> bool:
+        """Check a sequence without mutating state."""
+        return (
+            isinstance(sequence, int)
+            and not isinstance(sequence, bool)
+            and sequence >= 0
+            and sequence > self.highest - self.window
+            and sequence not in self._seen
+        )
+
 
 class SessionInitiator:
     def __init__(self, identity: AgentIdentity, peer: AgentIdentity, *, handle_epoch: int | None = None, replay_window: int = 128):
@@ -84,6 +95,7 @@ class SessionInitiator:
         self._hello: dict[str, Any] | None = None
         self.send_sequence = 0
         self.receive_window = ReplayWindow(window=replay_window)
+        self._lock = threading.RLock()
 
     def hello(self, *, issued_at: int | None = None) -> dict[str, Any]:
         issued_at = int(time.time()) if issued_at is None else issued_at
@@ -116,13 +128,26 @@ class SessionInitiator:
         return SecureRecord(self.peer_handle, self.session_id, sequence, b64(AESGCM(self._key).encrypt(nonce, raw, aad)), b64(nonce), padding_bucket).to_dict()
 
     def decrypt(self, record: dict[str, Any]) -> dict[str, Any]:
-        if self._key is None: raise ValueError("session is not established")
-        if record.get("session_id") != self.session_id or record.get("handle") != self.handle or not self.receive_window.accept(record.get("sequence")): raise ValueError("invalid or replayed session record")
-        aad = canonical({"session_id": self.session_id, "handle": self.handle, "sequence": record["sequence"], "padding_bucket": record["padding_bucket"]})
-        plaintext = AESGCM(self._key).decrypt(unb64(record["nonce"]), unb64(record["ciphertext"]), aad)
-        decoded = __import__("json").loads(plaintext)
-        if not isinstance(decoded, dict) or not isinstance(decoded.get("payload"), dict): raise ValueError("malformed secure session payload")
-        return decoded["payload"]
+        if self._key is None:
+            raise ValueError("session is not established")
+        with self._lock:
+            sequence = record.get("sequence")
+            if record.get("session_id") != self.session_id or record.get("handle") != self.handle or not self.receive_window.can_accept(sequence):
+                raise ValueError("invalid or replayed session record")
+            try:
+                padding_bucket = record["padding_bucket"]
+                if not isinstance(padding_bucket, int) or isinstance(padding_bucket, bool) or not 0 <= padding_bucket <= 1 << 20:
+                    raise ValueError("invalid padding bucket")
+                aad = canonical({"session_id": self.session_id, "handle": self.handle, "sequence": sequence, "padding_bucket": padding_bucket})
+                plaintext = AESGCM(self._key).decrypt(unb64(record["nonce"]), unb64(record["ciphertext"]), aad)
+                decoded = json.loads(plaintext)
+            except Exception as exc:
+                raise ValueError("secure session record authentication failed") from exc
+            if not isinstance(decoded, dict) or not isinstance(decoded.get("payload"), dict) or not isinstance(decoded.get("padding"), str):
+                raise ValueError("malformed secure session payload")
+            if not self.receive_window.accept(sequence):
+                raise ValueError("invalid or replayed session record")
+            return decoded["payload"]
 
     def respond(self, hello: dict[str, Any], *, issued_at: int | None = None) -> dict[str, Any]:
         if hello.get("peer_handle") != self.handle: raise ValueError("session hello handle mismatch")

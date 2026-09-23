@@ -37,8 +37,14 @@ def issue_capability(identity: AgentIdentity, *, audience: str, scopes: tuple[st
 
 def verify_capability(token: dict[str, Any], identity: AgentIdentity, *, audience: str, required_scope: str, now: int | None = None) -> None:
     now = int(time.time()) if now is None else now
-    if token.get("format") != "pqc-a2a-capability/1" or token.get("subject_handle") != opaque_handle(identity, epoch=now // 3600) and token.get("subject_handle") != opaque_handle(identity, epoch=(now // 3600) - 1): raise ValueError("capability subject mismatch")
-    if token.get("audience") != audience or required_scope not in token.get("scopes", []) or now > token.get("expires_at", 0): raise ValueError("capability expired or scope denied")
+    subject = token.get("subject_handle")
+    valid_handles = {opaque_handle(identity, epoch=now // 3600), opaque_handle(identity, epoch=(now // 3600) - 1)}
+    if token.get("format") != "pqc-a2a-capability/1" or subject not in valid_handles:
+        raise ValueError("capability subject mismatch")
+    scopes = token.get("scopes")
+    expires_at = token.get("expires_at")
+    if token.get("audience") != audience or not isinstance(scopes, list) or required_scope not in scopes or not isinstance(expires_at, int) or now > expires_at:
+        raise ValueError("capability expired or scope denied")
     unsigned = {k: v for k, v in token.items() if k != "signature"}
     with oqs.Signature(identity.sig_name) as verifier:
         if not verifier.verify(canonical(unsigned), unb64(token.get("signature", "")), identity.sig_public): raise ValueError("capability signature failed")
@@ -51,9 +57,13 @@ class Rendezvous:
         self.max_records = max_records
 
     def register(self, handle: str, endpoint: str, capability: dict[str, Any], identity: AgentIdentity, *, ttl_seconds: int = 300, now: int | None = None) -> None:
+        if not isinstance(handle, str) or not handle or not isinstance(endpoint, str) or not endpoint or ttl_seconds < 1 or ttl_seconds > 3600:
+            raise ValueError("invalid rendezvous registration")
         if len(self.records) >= self.max_records and handle not in self.records: raise RuntimeError("rendezvous capacity exceeded")
         now = int(time.time()) if now is None else now
         verify_capability(capability, identity, audience="rendezvous", required_scope="register", now=now)
+        if handle != capability.get("subject_handle"):
+            raise ValueError("capability subject does not own handle")
         self.records[handle] = ({"endpoint": endpoint, "handle": handle}, now + ttl_seconds)
 
     def lookup(self, handle: str, capability: dict[str, Any], identity: AgentIdentity, *, now: int | None = None) -> dict[str, Any]:
