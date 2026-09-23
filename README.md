@@ -8,7 +8,7 @@ Bu depo, otonom ajanlar arasındaki mesajlaşma için **araştırma amaçlı bir
 
 | Alan | Sonuç | Kanıt |
 |---|---:|---|
-| Python testleri | **17 passed** | `pytest -q` |
+| Python testleri | **18 passed** | `pytest -q` |
 | PQC smoke test | **Başarılı** | ML-KEM-768 + ML-DSA-65 + AES-256-GCM |
 | TLA+ invariant kontrolü | **0 ihlal** | 35 üretilen, 32 farklı durum |
 | Veri analizi kontrolleri | **Başarılı** | `benchmarks/analysis_summary.json` |
@@ -92,6 +92,23 @@ assert message["value"] == 42
 
 `examples/quickstart.py`, bu akışın şifreli identity dosyasıyla tekrar başlatılabilen sürümüdür.
 
+### İki sahte model ajanının encrypted streaming demosu
+
+`examples/encrypted_agents_stream.py`, gerçek bir model API’sine bağlanmadan iki deterministik sahte ajanı çalıştırır: `gpt-sim` ve `gemma-sim`. Her ajan kendi ML-KEM/ML-DSA identity’sini üretir, imzalı capability card yayınlar ve dört boyutlu sabit bir embedding metadata’sı ile selamlaşır. Embedding değerleri yalnızca test verisidir; model çıktısı veya kriptografik anahtar değildir.
+
+Mesaj envelope’ları 180 byte MTU ile fragment edilir, asynchronous queue üzerinden frame frame taşınır ve alıcıda `reassemble()` sonrası gerçek `open_envelope()` ile doğrulanır:
+
+```bash
+PYTHONPATH=src python examples/encrypted_agents_stream.py \
+  --frame-delay-ms 0.2 --mtu 180
+```
+
+Başarılı çalışmada her iki yön için `status: "ok"`, karşı tarafın model adı ve 153 fragment görülür. Aynı senaryo `tests/test_encrypted_agents_stream.py` içinde otomatik test edilir:
+
+```bash
+pytest tests/test_encrypted_agents_stream.py -q
+```
+
 ## Kurulum ve test
 
 Ubuntu üzerinde liboqs-python ilk PQC çağrısında liboqs derleyebilir. Güvenilir kurulum için aşağıdaki native bağımlılıklar gerekir:
@@ -109,7 +126,7 @@ python3 benchmarks/analyze_results.py
 Beklenen sonuç:
 
 ```text
-17 passed
+18 passed
 ```
 
 PQC kütüphanesi derlenemediğinde test toplama aşamasında hata alınır; bu durum testlerin atlanması anlamına gelmez. Üretimde liboqs sürümü, native build çıktısı ve platform matrisi sabitlenmelidir. TLA+ kontrolü ayrıca [Formal verification: TLA+](#formal-verification-tla) bölümündeki komutla çalıştırılır. Projede Python 3.10–3.12 için hazır bir CI workflow taslağı da bulunur; GitHub Actions’a yüklemek için repository token’ında `workflows` yetkisi etkin olmalıdır.
@@ -233,6 +250,7 @@ Test paketi şu davranışları kapsar:
 - Şifreli identity persistence, yanlış parola reddi ve public/private key eşleşmesi.
 - İmzalı capability card doğrulaması ve tamper reddi.
 - Şifreli ratchet state persistence ve süreç yeniden başlatma sonrası mesajlaşma.
+- Statik embedding metadata taşıyan sahte GPT/Gemma ajanlarının asynchronous fragmented stream üzerinden karşılıklı selamlaşması.
 
 ## Üretim sınırı ve kalan entegrasyonlar
 
