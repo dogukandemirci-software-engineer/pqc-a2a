@@ -353,7 +353,7 @@ def seal(sender: AgentIdentity, recipient: AgentIdentity, payload: dict[str, Any
     return unsigned
 
 
-def open_envelope(recipient: AgentIdentity, sender: AgentIdentity, envelope: dict[str, Any], replay: ReplayCache | None = None, trust_store: TrustStore | None = None, *, now: int | None = None, clock_skew: int = 30) -> dict[str, Any]:
+def open_envelope(recipient: AgentIdentity, sender: AgentIdentity, envelope: dict[str, Any], replay: ReplayCache | None = None, trust_store: TrustStore | None = None, *, now: int | None = None, clock_skew: int = 30, audit: Any | None = None, metrics: Any | None = None) -> dict[str, Any]:
     required = {"version", "message_id", "conversation_id", "sender", "recipient", "kem", "sig", "issued_at", "expires_at", "ephemeral_x25519", "kem_ciphertext", "nonce", "ciphertext", "signature"}
     _check_envelope(envelope, required, 1)
     if envelope["recipient"] != recipient.agent_id or envelope["sender"] != sender.agent_id:
@@ -380,6 +380,10 @@ def open_envelope(recipient: AgentIdentity, sender: AgentIdentity, envelope: dic
     payload = json.loads(AESGCM(key).decrypt(unb64(envelope["nonce"]), unb64(envelope["ciphertext"]), aad))
     if replay is not None and not replay.accept(envelope["message_id"]):
         raise ValueError("replay detected")
+    if audit is not None:
+        audit.event("envelope.open", message_id=envelope["message_id"], sender=sender.agent_id, recipient=recipient.agent_id)
+    if metrics is not None:
+        metrics.inc("envelope.open.success")
     return payload
 
 
@@ -392,10 +396,11 @@ class EphemeralKEMToken:
 
 
 class AsyncKEMRatchet:
-    def __init__(self, identity: AgentIdentity, peer: AgentIdentity, root_key: bytes, queue_size: int = 8):
-        if queue_size < 0:
+    def __init__(self, identity: AgentIdentity, peer: AgentIdentity, root_key: bytes, queue_size: int = 8, *, max_queue_size: int = 256, max_used_keys: int = 100_000):
+        if queue_size < 0 or max_queue_size < 1 or queue_size > max_queue_size or max_used_keys < 1:
             raise ValueError("queue_size cannot be negative")
         self.identity, self.peer, self.chain_key, self.queue = identity, peer, root_key, []
+        self.max_queue_size, self.max_used_keys = max_queue_size, max_used_keys
         self.used: set[str] = set()
         self._lock = threading.RLock()
         self.refill(queue_size)
@@ -404,6 +409,8 @@ class AsyncKEMRatchet:
     def refill(self, count: int = 1) -> list[EphemeralKEMToken]:
         if count < 0:
             raise ValueError("count cannot be negative")
+        if len(self.queue) + count > self.max_queue_size:
+            raise ValueError("ratchet token queue capacity exceeded")
         for _ in range(count):
             with oqs.KeyEncapsulation(self.identity.kem_name) as kem:
                 public = kem.generate_keypair(); secret = kem.export_secret_key()
@@ -426,7 +433,10 @@ class AsyncKEMRatchet:
         out = {**aad, "kem_ciphertext": b64(ct), "nonce": b64(secrets.token_bytes(12))}
         out["ciphertext"] = b64(AESGCM(key).encrypt(unb64(out["nonce"]), canonical(payload), canonical(aad)))
         out["signature"] = b64(_sign(self.identity, canonical(out)))
-        self.chain_key, self.used = next_chain, self.used | {token.token_id}
+        next_used = self.used | {token.token_id}
+        if len(next_used) > self.max_used_keys:
+            raise ValueError("ratchet used-key limit exceeded")
+        self.chain_key, self.used = next_chain, next_used
         return out
 
     @_synchronized
@@ -484,6 +494,7 @@ class AsyncKEMRatchet:
         obj.identity, obj.peer = identity, peer
         obj._lock = threading.RLock()
         obj.chain_key, obj.used = unb64(record["chain_key"]), set(record["used"])
+        obj.max_queue_size, obj.max_used_keys = 256, 100_000
         obj.queue = [EphemeralKEMToken(t["token_id"], unb64(t["public_key"]), unb64(t["secret_key"]), t.get("owner_id")) for t in record["queue"]]
         return obj
 

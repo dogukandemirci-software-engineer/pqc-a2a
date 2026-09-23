@@ -163,6 +163,14 @@ Doğrulanan çalışma, **35 durumun tamamında** hata bulmadan tamamlanmıştı
 
 Bu yardımcılar tam socket lifecycle, sertifika provisioning, TCP gateway, congestion policy veya durable regular-message replay cache uygulamaz. QUIC kullanımı gerçek bir bağlantının güvenli olduğu anlamına gelmez; sertifika güven zinciri ve peer identity uygulama tarafından doğru kurulmalıdır.
 
+### Operasyonel hardening yardımcıları
+
+`make_discovery_record()` ve `verify_discovery_record()`, Agent Card discovery yanıtını challenge, imzalı zaman penceresi ve replay cache ile bağlar. `provision_trust_store_from_discovery()` yalnızca önceden güvenilen anchor kimliğinin imzaladığı discovery kaydından pin ekler; bu otomatik PKI değildir.
+
+`DurableReplayCache` SQLite üzerinde atomic replay kabulü ve TTL temizliği yapar. `AuditLogger` ve `Metrics` başarılı envelope açma olaylarını uygulamanın log/metric sistemine bağlamak için hook sağlar. `SkippedKeyStore`, kayıp ve out-of-order session anahtarları için anahtar/adet/boyut sınırı uygular. `FileSecretProvider` ve `best_effort_zeroize()` KMS/HSM entegrasyonunun yerini tutmaz; Python immutable `bytes` değerlerinin güvenilir biçimde temizlenemeyeceği kabul edilmelidir.
+
+`TransportProfile.validate_certificate_hostname()` SAN/CN kontrolü yapar, `provision_dev_certificate()` yalnızca yerel entegrasyon testi için kısa ömürlü self-signed sertifika üretir ve `TcpFallback` length-prefixed TLS socket katmanı sağlar. Üretimde CA, sertifika yenileme, KMS/HSM ve mutual TLS politikası deployment tarafından sağlanmalıdır. Ayrıntılı kontrol listesi [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) içindedir.
+
 ## Veri analizi ve matematiksel doğrulamalar
 
 Bu bölümdeki sayılar `benchmarks/results.csv` içindeki üç gerçek benchmark satırından türetilir. Her satır hibrit PQC zarfını X25519 + Ed25519 klasik baseline'ı ile karşılaştırır. Yeni bir sonuç üretmek veya eksik gözlemleri tahmin etmek yerine, analiz script’i aynı CSV’yi okuyarak bütün metrikleri yeniden hesaplar:
