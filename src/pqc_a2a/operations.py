@@ -86,15 +86,19 @@ def best_effort_zeroize(buffer: bytearray) -> None:
 
 class DurableReplayCache:
     """SQLite-backed replay cache with atomic insert-and-expiry cleanup."""
-    def __init__(self, path: str | os.PathLike[str], ttl_seconds: float = 300.0, max_entries: int = 100_000):
-        if ttl_seconds <= 0 or max_entries < 1: raise ValueError("invalid replay limits")
-        self.path, self.ttl_seconds, self.max_entries = str(path), ttl_seconds, max_entries
+    def __init__(self, path: str | os.PathLike[str], ttl_seconds: float = 300.0, max_entries: int = 100_000, max_id_bytes: int = 256):
+        if ttl_seconds <= 0 or max_entries < 1 or max_id_bytes < 1: raise ValueError("invalid replay limits")
+        self.path, self.ttl_seconds, self.max_entries, self.max_id_bytes = str(path), ttl_seconds, max_entries, max_id_bytes
         self._lock = threading.RLock()
         self._memory_db = self.path == ":memory:"
         self._db = sqlite3.connect(":memory:", timeout=5, isolation_level="IMMEDIATE") if self._memory_db else None
-        with self._connect() as db:
+        db = self._connect()
+        try:
             db.execute("CREATE TABLE IF NOT EXISTS replay (message_id TEXT PRIMARY KEY, seen_at REAL NOT NULL)")
             db.commit()
+        finally:
+            if not self._memory_db:
+                db.close()
 
     def _connect(self):
         if self._db is not None:
@@ -105,15 +109,32 @@ class DurableReplayCache:
         return db
 
     def accept(self, message_id: str, now: float | None = None) -> bool:
-        if not isinstance(message_id, str) or not message_id: raise ValueError("message_id required")
+        if not isinstance(message_id, str) or not message_id or len(message_id.encode("utf-8")) > self.max_id_bytes: raise ValueError("message_id required")
         now = time.time() if now is None else now
         cutoff = now - self.ttl_seconds
-        with self._lock, self._connect() as db:
-            db.execute("DELETE FROM replay WHERE seen_at < ?", (cutoff,))
-            if db.execute("SELECT 1 FROM replay WHERE message_id = ?", (message_id,)).fetchone(): return False
-            if db.execute("SELECT COUNT(*) FROM replay").fetchone()[0] >= self.max_entries:
-                raise RuntimeError("durable replay cache capacity exceeded")
-            db.execute("INSERT INTO replay VALUES (?, ?)", (message_id, now)); db.commit(); return True
+        with self._lock:
+            db = self._connect()
+            try:
+                db.execute("DELETE FROM replay WHERE seen_at < ?", (cutoff,))
+                if db.execute("SELECT 1 FROM replay WHERE message_id = ?", (message_id,)).fetchone(): return False
+                if db.execute("SELECT COUNT(*) FROM replay").fetchone()[0] >= self.max_entries:
+                    raise RuntimeError("durable replay cache capacity exceeded")
+                db.execute("INSERT INTO replay VALUES (?, ?)", (message_id, now)); db.commit(); return True
+            finally:
+                if not self._memory_db:
+                    db.close()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._db is not None:
+                self._db.close()
+                self._db = None
+
+    def __enter__(self) -> "DurableReplayCache":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 class AuditLogger:

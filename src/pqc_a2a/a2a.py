@@ -34,7 +34,7 @@ def verify_agent_card(document: dict[str, Any], trusted_identity: AgentIdentity)
     if document.get("format") != "pqc-a2a-agent-card/1":
         raise ValueError("unsupported Agent Card format")
     card = document.get("card")
-    if not isinstance(card, dict) or card.get("issuer") != trusted_identity.agent_id or card.get("issuerPublicKey") != trusted_identity.public_record():
+    if not isinstance(card, dict) or card.get("name") != trusted_identity.agent_id or card.get("issuer") != trusted_identity.agent_id or card.get("issuerPublicKey") != trusted_identity.public_record():
         raise ValueError("Agent Card issuer binding failed")
     with oqs.Signature(trusted_identity.sig_name) as verifier:
         if not verifier.verify(canonical(card), unb64(document.get("signature", "")), trusted_identity.sig_public):

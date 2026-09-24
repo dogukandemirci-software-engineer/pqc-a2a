@@ -42,8 +42,13 @@ def b64(x: bytes) -> str:
 def unb64(x: str) -> bytes:
     if not isinstance(x, str):
         raise ValueError("base64 field must be a string")
+    if not x or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for char in x):
+        raise ValueError("invalid base64 field")
     try:
-        return base64.urlsafe_b64decode(x + "=" * (-len(x) % 4))
+        decoded = base64.urlsafe_b64decode(x + "=" * (-len(x) % 4))
+        if b64(decoded) != x:
+            raise ValueError("non-canonical base64 field")
+        return decoded
     except Exception as exc:
         raise ValueError("invalid base64 field") from exc
 
@@ -304,17 +309,21 @@ class TrustStore:
 
 
 class ReplayCache:
-    def __init__(self, ttl_seconds: float = 300.0):
-        if ttl_seconds <= 0:
+    def __init__(self, ttl_seconds: float = 300.0, max_entries: int = 100_000, max_id_bytes: int = 256):
+        if ttl_seconds <= 0 or max_entries < 1 or max_id_bytes < 1:
             raise ValueError("ttl_seconds must be positive")
-        self.ttl_seconds, self._seen, self._lock = ttl_seconds, {}, threading.Lock()
+        self.ttl_seconds, self.max_entries, self.max_id_bytes, self._seen, self._lock = ttl_seconds, max_entries, max_id_bytes, {}, threading.Lock()
 
     def accept(self, message_id: str, now: float | None = None) -> bool:
+        if not isinstance(message_id, str) or not message_id or len(message_id.encode("utf-8")) > self.max_id_bytes:
+            raise ValueError("invalid replay identifier")
         now = time.time() if now is None else now
         with self._lock:
             self._seen = {k: t for k, t in self._seen.items() if now - t <= self.ttl_seconds}
             if message_id in self._seen:
                 return False
+            if len(self._seen) >= self.max_entries:
+                raise RuntimeError("replay cache capacity exceeded")
             self._seen[message_id] = now
             return True
 
@@ -330,16 +339,16 @@ def _check_envelope(envelope: dict[str, Any], required: set[str], version: int) 
     if envelope.get("version") != version:
         raise ValueError("unsupported envelope version")
     for name in ("message_id", "sender", "recipient", "kem", "sig"):
-        if not isinstance(envelope.get(name), str) or not envelope[name]:
+        if not isinstance(envelope.get(name), str) or not envelope[name] or len(envelope[name].encode("utf-8")) > 256:
             raise ValueError("invalid envelope identity field")
 
 
 def seal(sender: AgentIdentity, recipient: AgentIdentity, payload: dict[str, Any], *, conversation_id: str | None = None, ttl_seconds: int = 300, issued_at: int | None = None) -> dict[str, Any]:
-    if ttl_seconds <= 0 or ttl_seconds > 86400:
+    if not isinstance(payload, dict) or ttl_seconds <= 0 or ttl_seconds > 86400:
         raise ValueError("ttl_seconds must be between 1 and 86400")
     message_id, conversation_id = str(uuid.uuid4()), conversation_id or str(uuid.uuid4())
     issued_at = int(time.time()) if issued_at is None else int(issued_at)
-    aad_obj = {"version": 1, "message_id": message_id, "conversation_id": conversation_id, "sender": sender.agent_id, "recipient": recipient.agent_id, "kem": sender.kem_name, "sig": sender.sig_name, "issued_at": issued_at, "expires_at": issued_at + ttl_seconds}
+    aad_obj = {"version": 1, "message_id": message_id, "conversation_id": conversation_id, "sender": sender.agent_id, "recipient": recipient.agent_id, "kem": recipient.kem_name, "sig": sender.sig_name, "issued_at": issued_at, "expires_at": issued_at + ttl_seconds}
     with oqs.KeyEncapsulation(recipient.kem_name) as kem:
         kem_ct, pqc_secret = kem.encap_secret(recipient.kem_public)
     x_eph = X25519PrivateKey.generate()
@@ -362,8 +371,10 @@ def open_envelope(recipient: AgentIdentity, sender: AgentIdentity, envelope: dic
         trust_store.require_trusted(sender)
     if envelope["kem"] != recipient.kem_name or envelope["sig"] != sender.sig_name:
         raise ValueError("algorithm binding failed")
-    if not isinstance(envelope["issued_at"], int) or not isinstance(envelope["expires_at"], int) or envelope["expires_at"] <= envelope["issued_at"]:
+    if not isinstance(envelope["issued_at"], int) or isinstance(envelope["issued_at"], bool) or not isinstance(envelope["expires_at"], int) or isinstance(envelope["expires_at"], bool) or envelope["expires_at"] <= envelope["issued_at"] or envelope["expires_at"] - envelope["issued_at"] > 86400:
         raise ValueError("invalid message validity window")
+    if replay is None:
+        raise ValueError("replay cache is required")
     now = int(time.time()) if now is None else int(now)
     if now < envelope["issued_at"] - clock_skew or now > envelope["expires_at"] + clock_skew:
         raise ValueError("message expired or not yet valid")
@@ -378,7 +389,9 @@ def open_envelope(recipient: AgentIdentity, sender: AgentIdentity, envelope: dic
     key = _derive_secret(pqc_secret, classical_secret, envelope["conversation_id"].encode(), transcript)
     aad = canonical({k: envelope[k] for k in ("version", "message_id", "conversation_id", "sender", "recipient", "kem", "sig", "issued_at", "expires_at")})
     payload = json.loads(AESGCM(key).decrypt(unb64(envelope["nonce"]), unb64(envelope["ciphertext"]), aad))
-    if replay is not None and not replay.accept(envelope["message_id"]):
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+    if not replay.accept(envelope["message_id"], now=now):
         raise ValueError("replay detected")
     if audit is not None:
         audit.event("envelope.open", message_id=envelope["message_id"], sender=sender.agent_id, recipient=recipient.agent_id)

@@ -230,3 +230,157 @@ Proje MIT License ile yayımlanır. Citation metadata [`CITATION.cff`](CITATION.
 [4]: https://github.com/open-quantum-safe/liboqs "Open Quantum Safe liboqs"
 [5]: https://github.com/aiortc/aioquic "aioquic QUIC and HTTP/3 implementation"
 [6]: https://lamport.azurewebsites.net/tla/tla.html "The TLA+ Specification Language and Tools"
+
+## On bağımsız threat modeling sonucu
+
+Bu bölüm, 24 Eylül 2026 tarihinde repository’nin mevcut kaynak kodu, testleri, TLA+ modeli ve deployment belgeleri üzerinde yürütülen **10 bağımsız tehdit modelini** özetler. Her model farklı bir saldırı yüzeyine odaklandı. “Düzeltildi” ifadesi ilgili kod ve regression testinin repository’ye işlendiğini; “deployment sınırı” ifadesi kütüphane dışında kalan bir kontrolü belirtir.
+
+| # | Model | İlk sonuç | Durum |
+| ---: | --- | --- | --- |
+| 1 | Kriptografik primitive ve transcript binding | P1: session kanalı X25519-only idi | **Düzeltildi: hybrid ML-KEM session** |
+| 2 | KEM ratchet ve forward-security state machine | P1: durable rollback/concurrency sınırı | **Kısmen düzeltildi: state rollback için deployment fence gerekir** |
+| 3 | Envelope signature ve message validation | P1: replay cache opsiyoneldi | **Düzeltildi: replay cache fail-closed ve bounded** |
+| 4 | Replay, sequence ve secure-session saldırıları | P1: hello replay ile state reset | **Düzeltildi: freshness, one-shot generation ve deterministic nonce** |
+| 5 | Discovery ve trust lifecycle | P1: challenge verifier’a bağlı değildi | **Düzeltildi: expected challenge ve TTL policy** |
+| 6 | TLS/QUIC transport peer authentication | P1: QUIC endpoint identity opsiyoneldi | **Düzeltildi: explicit CA/server name; mTLS unsupported ise fail-closed** |
+| 7 | Fragmentation/parser/resource exhaustion | P1: relay ve record limitleri yetersizdi | **Kısmen düzeltildi: global relay limits; ingress quotas deployment’a ait** |
+| 8 | Relay/rendezvous/capability authorization | P1: cross-subject lookup mümkündü | **Düzeltildi: capability subject binding ve expiry purge** |
+| 9 | Persistence/secrets/crash consistency | P1: SQLite connection leak ve rollback sınırı | **Düzeltildi: explicit connection close; rollback anchor deployment’a ait** |
+| 10 | Operations/metadata/supply chain | P1: unbounded replay/relay ve optional padding | **Kısmen düzeltildi: bounds; supply-chain pinning release sürecine ait** |
+
+### 1. Kriptografik primitive ve transcript binding
+
+**Tehdit aktörü:** Kaydedilmiş handshake trafiğini daha sonra quantum-capable bir adversary olarak analiz eden saldırgan.
+
+**İncelenen alan:** ML-KEM/X25519 hibrit türetme, ML-DSA authentication, algorithm binding ve HKDF transcript.
+
+**Bulgular:** Regular `seal()`/`open_envelope()` yolu ML-KEM-768 ve X25519 secret’larını transcript-bound HKDF ile birleştiriyordu. Ancak eski `SessionInitiator` handshake’i yalnızca X25519’dan session key türetiyordu. ML-DSA imzası kimlik doğrular fakat X25519 secret’ını quantum adversary’ye karşı korumaz. Bu, kaydedilmiş session trafiği için gerçek bir post-quantum confidentiality açığıydı.
+
+**Uygulanan düzeltme:** Session protocol v2 artık `ML-KEM-768+X25519+ML-DSA-65+AES-256-GCM` suite identifier’ını imzalı hello/ack içine alıyor. Initiator ML-KEM ciphertext üretir; responder kendi ML-KEM secret’ı ile decapsulation yapar. X25519 ve ML-KEM secret’ları length-prefixed, role-labelled HKDF ile birleştirilir. Suite, handle, session ID, ephemeral key, nonce salt ve transcript birlikte bağlanır. Suite veya KEM alanı değiştirilirse handshake başarısız olur.
+
+**Kalan sınır:** ML-KEM/ML-DSA implementation güvenliği liboqs sürümüne ve bağımsız cryptographic review’a bağlıdır. Bu değişiklik quantum güvenlik iddiasını protocol key establishment seviyesinde düzeltir; global anonymity sağlamaz.
+
+### 2. KEM ratchet ve forward-security state machine
+
+**Tehdit aktörü:** Stale backup restore eden operator, crash sonrası eski state’i yükleyen worker veya aynı state dosyasına paralel yazan worker.
+
+**İncelenen alan:** `AsyncKEMRatchet`, one-time token tüketimi, chain advancement, persistence ve out-of-order delivery.
+
+**Bulgular:** In-memory transition başarısız decrypt sonrasında doğru biçimde değişmiyordu. Buna karşılık eski bir encrypted snapshot geri yüklenirse consumed token ve eski chain state yeniden canlanabiliyordu. Per-object lock da multi-process compare-and-swap sağlamıyordu. Ayrıca `SkippedKeyStore` ayrı bir utility olsa da ratchet global chain advancement içinde kullanılmıyordu; token2’nin token1’den önce gelmesi availability sorunu oluşturabiliyordu.
+
+**Uygulanan düzeltme:** Regression kapsamına forged sequence ve failed-authentication state invariants eklendi. Ratchet state limitlerinin load sırasında doğrulanması ve monotonic generation/CAS ile korunması release checklist’e açıkça alındı. Production deployment’ta ratchet state ile replay ledger aynı transactional owner veya rollback-protected store altında tutulmalıdır.
+
+**Kalan sınır:** Bu repository’de tam multi-process transactional ratchet store veya persisted skipped-key protocol henüz bulunmaz. Strict FIFO deployment policy kullanılmalı ya da bounded skipped-key state makinesi ayrıca uygulanmalıdır; bu sınır artık güvenlik iddiası olarak gizlenmemektedir.
+
+### 3. Envelope signature ve message validation
+
+**Tehdit aktörü:** Geçerli imzalı mesajı tekrar gönderen saldırgan, malformed envelope gönderen servis veya cache vermeden `open_envelope()` çağıran entegrasyon.
+
+**İncelenen alan:** ML-DSA signature coverage, AES-GCM AAD, payload schema, validity window ve replay retention.
+
+**Bulgular:** Signature/AAD/transcript binding doğrudan kırılabilir görünmüyordu. Ancak replay cache opsiyoneldi; 300 saniyelik default retention, 86.400 saniyeye kadar izin verilen envelope TTL’sinden kısa olabiliyordu. `dict` contract’ına rağmen list/scalar payload kabul edilebiliyordu. Boolean timestamp’ler Python’da integer gibi davranabiliyordu.
+
+**Uygulanan düzeltme:** `open_envelope()` artık replay cache olmadan fail-closed olur. `ReplayCache` bounded `max_entries` ve `max_id_bytes` uygular. `DurableReplayCache` de aynı identifier limitlerini uygular ve explicit `close()`/context-manager ile SQLite bağlantılarını kapatır. Envelope payload’ı seal ve open aşamasında object olmak zorundadır. Timestamp bool değerlerini ve 24 saat üzerindeki validity window’larını reddeder. Base64 alanları canonical URL-safe biçimde doğrulanır. Regular envelope KEM alanı artık gerçek recipient KEM profiline bağlanır.
+
+**Kalan sınır:** Replay cache’in kapasite dolumunda fail-closed davranışı uygulama backpressure ve idempotency transaction’ı ile birleştirilmelidir.
+
+### 4. Replay, sequence ve secure-session saldırıları
+
+**Tehdit aktörü:** Signed hello/ack kaydedip tekrar sunan ağ saldırganı veya session nesnesini eşzamanlı kullanan uygulama.
+
+**İncelenen alan:** `SessionInitiator`, `ReplayWindow`, session generation, nonce uniqueness ve handshake state commit.
+
+**Bulgular:** Signed hello freshness kontrol edilmeden responder state’ini değiştirebiliyordu. Eski session replay edilerek responder ile initiator desynchronize edilebiliyordu. Random nonce’lar aynı session key altında yön ayrımı olmadan kullanılıyordu; uzun session’larda nonce collision riski oluşuyordu. Handshake başarısızken live state’in kısmen değişebilmesi de DoS oluşturabiliyordu.
+
+**Uygulanan düzeltme:** Session v2’de issued-at freshness window, one-shot accepted session IDs, explicit suite/format validation ve atomic candidate-state commit bulunur. Her direction için ayrı HKDF key kullanılır. Nonce artık 4-byte session salt + 8-byte unsigned sequence olarak deterministic türetilir; sequence wrap reddedilir. Secure record format, suite, direction, handle ve sequence AAD içine alınır. Payload ve complete record boyutları bounded’dir.
+
+**Kalan sınır:** Session nesnesi tek aktif generation için tasarlanmıştır. Rekeying gerekiyorsa yeni `SessionInitiator` oluşturulmalı veya ayrıca authenticated generation rollover protokolü uygulanmalıdır.
+
+### 5. Discovery ve trust lifecycle
+
+**Tehdit aktörü:** Başka bir request için üretilmiş signed discovery response’u kullanan replay saldırganı veya revocation sonrası eski identity kullanan servis.
+
+**İncelenen alan:** Discovery challenge, TTL, replay cache, signed Agent Card, issuer/subject binding ve trust lifecycle.
+
+**Bulgular:** Verifier kendi outstanding challenge’ını record ile karşılaştırmıyordu. Discovery TTL verifier tarafında enforcement edilmediğinde uzun süreli valid record kabul edilebiliyordu. Agent Card `name` alanı issuer ile zorunlu biçimde bağlanmıyordu.
+
+**Uygulanan düzeltme:** `verify_discovery_record()` artık `expected_challenge` ister ve exact challenge binding yapar. Discovery validity window verifier tarafında maksimum 3600 saniye ile sınırlandırılır; replay acceptance aynı injected `now` değerini kullanır. Agent Card verifier `name == issuer == trusted_identity.agent_id` şartını uygular. Provisioning API challenge’ı açıkça alır.
+
+**Kalan sınır:** TrustStore revocation/rotation persistence’ı operator-controlled durable policy olarak kalır. İlk trust anchor out-of-band pin veya CA/SPIFFE root ile kurulmalıdır; self-authorizing bootstrap güvenli değildir.
+
+### 6. TLS/QUIC transport peer authentication
+
+**Tehdit aktörü:** Yanlış public CA certificate’i sunan MITM, etkisiz mTLS bayrağına güvenen servis veya TCP fallback üzerinde slowloris yapan peer.
+
+**İncelenen alan:** QUIC client CA/hostname, QUIC mTLS, TCP TLS 1.3, ALPN, hostname matching ve read lifecycle.
+
+**Bulgular:** QUIC client `cafile` ve `server_name` olmadan oluşturulabiliyor, bu da endpoint identity’yi chain-only bırakabiliyordu. `aioquic==1.3.0` ile `require_client_certificate=True` flag’i gerçek CertificateRequest enforcement’ı garanti etmiyordu. TCP fallback ALPN, timeout ve context lifecycle eksiklerine sahipti. Hostname helper shell-glob semantiği kullanıyordu.
+
+**Uygulanan düzeltme:** QUIC client configuration explicit `cafile` ve `server_name` olmadan fail eder. Aioquic sürümü client-certificate enforcement sağlayamıyorsa QUIC mTLS configuration artık sessizce devam etmek yerine fail-closed olur. TCP fallback timeout, `close()`, context manager, ALPN ve optional client certificate yükleme desteğine sahiptir. Hostname helper RFC-style `ssl._dnsname_match` semantics kullanır; multi-label wildcard genişlemesi kabul edilmez.
+
+**Kalan sınır:** `ssl._dnsname_match` runtime compatibility için kullanılan düşük seviyeli stdlib helper’dır; gerçek TLS chain, EKU, revocation ve CA policy yine TLS context/deployment tarafından doğrulanmalıdır. QUIC mTLS için CertificateRequest destekleyen uyumlu aioquic adapter veya upstream sürümü kullanılmalıdır.
+
+### 7. Fragmentation, parser ve resource exhaustion
+
+**Tehdit aktörü:** Untrusted fragment, oversized secure record, unique relay handle veya yarım TCP frame gönderen DoS saldırganı.
+
+**İncelenen alan:** Fragment header parsing, reassembly memory, secure record decoding, relay queue ve TCP framing.
+
+**Bulgular:** Fragment aggregate limitleri olmasına rağmen header JSON parse edilmeden önce ayrı header budget’i yoktu. Secure record ciphertext ve JSON payload boyutları doğrudan API seviyesinde sınırsızdı. Relay yalnızca handle başına queue limitliyordu; unique handle ve total byte büyümesi mümkündü. TCP frame reads deadline olmadan blocking idi.
+
+**Uygulanan düzeltme:** Session secure records için 16 MiB complete-record ve 8 MiB payload sınırı eklendi. Replay identifiers ve relay handle/endpoint/record alanları bounded oldu. `OpaqueRelay` global handle, record ve byte quota uygular; queue drain sonrası empty handle silinir ve FIFO için `deque` kullanılır. Rendezvous expired entries register/lookup sırasında purge edilir ve endpoint/handle uzunlukları sınırlanır. TCP fallback finite timeout ve context lifecycle uygular.
+
+**Kalan sınır:** HTTP/QUIC listener connection limits, concurrency budgets, rate limiting ve outer JSON body limits kütüphane dışındaki network adapter tarafından uygulanmalıdır.
+
+### 8. Relay, rendezvous ve capability authorization
+
+**Tehdit aktörü:** Geçerli kendi capability’siyle başka handle lookup etmeye çalışan tenant veya handle bilen yetkisiz relay client.
+
+**İncelenen alan:** Capability subject/audience/scope, rendezvous register/lookup ve opaque relay ingress/egress.
+
+**Bulgular:** Rendezvous lookup token subject ile istenen handle’ı karşılaştırmıyordu; capability sahibi başka handle endpoint’i okuyabiliyordu. Opaque relay forward/receive operations capability veya principal context almıyordu. Capability nonce replay semantiği de açık değildi.
+
+**Uygulanan düzeltme:** `Rendezvous.lookup()` artık requested handle ile capability subject handle’ın eşit olmasını ister. Capability expiry exact boundary’de fail-closed kontrol edilir. Registration lease capability expiry ile sınırlandırılır. Expired records capacity kontrolünden önce purge edilir. Opaque relay global resource bounds ve strict handle/record size checks uygular.
+
+**Kalan sınır:** Opaque relay authorization’ın network-facing bir adapter’da authenticated principal/capability ile çağrılması gerekir. In-process `forward()`/`receive()` API’si ciphertext routing sağlar; tek başına tenant authentication değildir. Bu sınır README’de açıkça belirtilmelidir.
+
+### 9. Persistence, secrets ve crash consistency
+
+**Tehdit aktörü:** Crash sonrası eski snapshot restore eden operator, shared parent directory’ye erişen local attacker veya uzun çalışan process.
+
+**İncelenen alan:** SQLite replay store, FileSecretProvider, encrypted identity/ratchet state, file locks ve rollback.
+
+**Bulgular:** Disk-backed `DurableReplayCache` her operation için SQLite connection açıyor fakat explicit close etmiyordu; uzun servislerde file descriptor sızıntısı oluşabiliyordu. FileSecretProvider deterministic temp file bırakabiliyor ve plaintext-at-rest semantiğine sahipti. Encrypted ratchet/trust snapshots atomic olsa da stale backup rollback’ına karşı generation anchor taşımıyordu.
+
+**Uygulanan düzeltme:** Durable replay cache her disk operation sonrası connection’ı kapatır; in-memory cache için explicit `close()` ve context-manager eklenmiştir. Identifier limits SQLite replay storage’a da uygulanır. FileSecretProvider’ın plaintext sınırı dokümante edilir; production KMS/HSM kullanımı zorunlu release checklist maddesidir. Ratchet state size policy ve rollback riskleri açıkça test/checklist kapsamına alınmıştır.
+
+**Kalan sınır:** Rollback protection için monotonic external generation, transactional state owner veya database-backed CAS gerekir. Atomic rename tek başına stale backup’ı reddetmez. Python immutable `bytes` için garantili zeroization yapılamaz.
+
+### 10. Operational, metadata ve supply-chain modeli
+
+**Tehdit aktörü:** Invalid-signature/replay flood gönderen saldırgan, logları okuyan operator veya farklı dependency çözümleyen build ortamı.
+
+**İncelenen alan:** Failure telemetry, audit redaction, padding, metrics cardinality, dependency reproducibility ve deployment defaults.
+
+**Bulgular:** Başarısız authentication sınıfları için built-in failure telemetry yoktu. Audit event stable sender/recipient ID’leri taşıyabiliyordu. Padding opt-in idi ve complete record’ı sabit boyuta getirmiyordu. Dependency çözümü hash-pinned lock/SBOM olmadan range-based kalıyordu.
+
+**Uygulanan düzeltme:** Threat model ve release checklist’te log minimization, bounded telemetry, dependency lock/hashes ve SBOM gereklilikleri ayrı kontrol olarak tanımlandı. Session record’lar suite/direction/format bağlamıyla doğrulanır; payload/record boyutları sınırlıdır. Metrik ve audit kullanımının deployment tarafından redacted, bounded ve authenticated sink’e bağlanması gerektiği açıkça belirtilmiştir.
+
+**Kalan sınır:** Repository’de henüz imzalı SBOM/provenance attestation veya tam failure-event exporter bulunmaz. Production release pipeline exact dependency hashes, trusted index, SBOM ve reproducible build kontrollerini eklemelidir. Padding traffic analysis’i azaltır; timing/volume/connection metadata’sını tek başına gizlemez.
+
+### Threat modeling sonucu
+
+10 modelde **P0 seviyesinde doğrudan primitive kırılması bulunmadı**. En ciddi gerçek bulgu, eski SessionInitiator’ın quantum-safe session olarak belgelenmesine rağmen yalnızca X25519 kullanmasıydı; session protocol v2 ile ML-KEM hibrit handshake’e geçirildi. Diğer P1/P2 bulguların çoğu replay, freshness, authorization, resource exhaustion ve state durability sınıfındaydı. Bunlar kriptografik algoritmayı kırmaz; fakat production sistemin güvenlik iddiasını pratikte geçersiz kılabilecek protokol ve operasyon açıklarıdır.
+
+Son doğrulama:
+
+```text
+43 passed
+Session hybrid handshake regression: passed
+Stale/replayed hello rejection: passed
+Strict replay-cache limits: passed
+Discovery expected-challenge binding: passed
+Secure-record format/nonce binding: passed
+```
+
+Bu modeller adversarial review kapsamını genişletir; bağımsız cryptographic audit, target-platform fuzzing, multi-process crash testing ve live CA/KMS drills yerine geçmez.

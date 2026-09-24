@@ -1,5 +1,6 @@
 import json
 import ssl
+import time
 
 import pytest
 
@@ -64,8 +65,8 @@ def test_archive_digest_and_algorithm_are_verified():
 
 
 def test_tls_client_does_not_default_to_insecure_peer_acceptance():
-    config = TransportProfile().client_configuration()
-    assert config.verify_mode == ssl.CERT_REQUIRED
+    with pytest.raises(ValueError, match="cafile"):
+        TransportProfile().client_configuration()
 
 
 def test_durable_memory_replay_cache_persists_between_operations():
@@ -87,11 +88,56 @@ def test_secure_channel_failed_authentication_does_not_advance_window():
     sender, receiver = AgentIdentity("window-a"), AgentIdentity("window-b")
     client = SessionInitiator(sender, receiver, handle_epoch=0)
     server = SessionInitiator(receiver, sender, handle_epoch=0)
-    hello = client.hello(issued_at=100)
-    client.accept_ack(server.respond(hello, issued_at=101))
+    hello = client.hello(issued_at=int(time.time()))
+    client.accept_ack(server.respond(hello, issued_at=int(time.time())))
     record = client.encrypt({"ok": True})
     forged = dict(record)
     forged["sequence"] = 100000
     with pytest.raises(ValueError):
         server.decrypt(forged)
     assert server.decrypt(record) == {"ok": True}
+
+
+def test_session_hello_replay_and_stale_handshake_are_rejected():
+    from pqc_a2a import SessionInitiator
+    sender, receiver = AgentIdentity("fresh-a"), AgentIdentity("fresh-b")
+    client = SessionInitiator(sender, receiver)
+    server = SessionInitiator(receiver, sender)
+    hello = client.hello(issued_at=100)
+    with pytest.raises(ValueError, match="stale"):
+        server.respond(hello, now=1000)
+    fresh = client.hello(issued_at=int(time.time()))
+    ack = server.respond(fresh, issued_at=int(time.time()))
+    client.accept_ack(ack)
+    with pytest.raises(ValueError, match="replay"):
+        server.respond(fresh, now=int(time.time()))
+
+
+def test_replay_cache_is_bounded_and_rejects_invalid_identifiers():
+    cache = ReplayCache(ttl_seconds=60, max_entries=1, max_id_bytes=8)
+    assert cache.accept("one")
+    with pytest.raises(RuntimeError):
+        cache.accept("two")
+    with pytest.raises(ValueError):
+        cache.accept("too-long-id")
+
+
+def test_session_nonce_and_format_are_authenticated():
+    from pqc_a2a import SessionInitiator
+    sender, receiver = AgentIdentity("nonce-a"), AgentIdentity("nonce-b")
+    client, server = SessionInitiator(sender, receiver), SessionInitiator(receiver, sender)
+    hello = client.hello(issued_at=int(time.time()))
+    client.accept_ack(server.respond(hello, issued_at=int(time.time())))
+    record = client.encrypt({"ok": True})
+    mutated = dict(record)
+    mutated["format"] = "pqc-a2a-secure-record/1"
+    with pytest.raises(ValueError):
+        server.decrypt(mutated)
+
+
+def test_discovery_requires_the_outstanding_challenge():
+    identity = AgentIdentity("challenge-agent")
+    cache = ReplayCache()
+    record = __import__("pqc_a2a").make_discovery_record(__import__("pqc_a2a").AgentCard(identity.agent_id), identity, challenge="expected")
+    with pytest.raises(ValueError, match="challenge"):
+        __import__("pqc_a2a").verify_discovery_record(record, trusted_identity=identity, replay=cache, expected_challenge="different")

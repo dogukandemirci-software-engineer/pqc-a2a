@@ -8,7 +8,6 @@ import math
 import ssl
 import socket
 import struct
-import fnmatch
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Iterable
@@ -42,6 +41,8 @@ class TransportProfile:
         CA intentionally makes a real connection fail rather than silently
         accepting an unauthenticated peer.
         """
+        if not cafile or not server_name:
+            raise ValueError("explicit cafile and server_name are required for QUIC peer authentication")
         config = QuicConfiguration(is_client=True, alpn_protocols=[self.alpn], max_datagram_frame_size=self.mtu, cafile=cafile, server_name=server_name, verify_mode=ssl.CERT_REQUIRED)
         if certificate and private_key:
             config.load_cert_chain(certificate, private_key)
@@ -50,6 +51,8 @@ class TransportProfile:
     def server_configuration(self, certificate: str, private_key: str, *, cafile: str | None = None, require_client_certificate: bool = False) -> QuicConfiguration:
         if require_client_certificate and not cafile:
             raise ValueError("cafile is required for mutual TLS")
+        if require_client_certificate:
+            raise ValueError("aioquic 1.3.0 cannot enforce QUIC client certificates through this profile")
         config = QuicConfiguration(is_client=False, alpn_protocols=[self.alpn], max_datagram_frame_size=self.mtu, cafile=cafile, verify_mode=ssl.CERT_REQUIRED if require_client_certificate else ssl.CERT_NONE)
         config.load_cert_chain(certificate, private_key)
         return config
@@ -60,13 +63,25 @@ class TransportProfile:
         if not hostname: raise ValueError("hostname is required")
         with open(certificate, "rb") as handle:
             cert = x509.load_pem_x509_certificate(handle.read())
+        names: list[tuple[str, str]] = []
         try:
-            names = list(cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName))
+            san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+            names.extend(("DNS", value) for value in san.get_values_for_type(x509.DNSName))
+            names.extend(("IP Address", str(value)) for value in san.get_values_for_type(x509.IPAddress))
         except x509.ExtensionNotFound:
-            names = []
+            pass
         if not names:
-            names = [attribute.value for attribute in cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)]
-        if not any(fnmatch.fnmatchcase(hostname.lower(), name.lower()) for name in names):
+            names = [("commonName", attribute.value) for attribute in cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)]
+        matched = False
+        for kind, name in names:
+            if kind == "IP Address":
+                matched = matched or hostname == name
+            elif kind in {"DNS", "commonName"}:
+                try:
+                    matched = matched or bool(ssl._dnsname_match(name, hostname))
+                except (TypeError, ValueError):
+                    matched = False
+        if not matched:
             raise ValueError("certificate hostname/SAN mismatch")
         with open(certificate, "rb") as handle:
             return hashlib.sha256(handle.read()).hexdigest()
@@ -74,9 +89,19 @@ class TransportProfile:
 
 class TcpFallback:
     """Length-prefixed TLS fallback for deployments where QUIC is unavailable."""
-    def __init__(self, sock: socket.socket, *, max_frame_size: int = 16 * 1024 * 1024):
-        if max_frame_size < 1: raise ValueError("invalid TCP frame limit")
-        self.sock, self.max_frame_size = sock, max_frame_size
+    def __init__(self, sock: socket.socket, *, max_frame_size: int = 16 * 1024 * 1024, timeout_seconds: float = 10.0):
+        if max_frame_size < 1 or timeout_seconds <= 0: raise ValueError("invalid TCP frame/timeout limit")
+        self.sock, self.max_frame_size, self.timeout_seconds = sock, max_frame_size, timeout_seconds
+        self.sock.settimeout(timeout_seconds)
+
+    def close(self) -> None:
+        self.sock.close()
+
+    def __enter__(self) -> "TcpFallback":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def send(self, payload: bytes) -> None:
         if not isinstance(payload, bytes) or len(payload) > self.max_frame_size: raise ValueError("TCP payload exceeds limit")
@@ -96,21 +121,33 @@ class TcpFallback:
         return b"".join(chunks)
 
     @classmethod
-    def client(cls, sock: socket.socket, *, cafile: str, server_hostname: str, max_frame_size: int = 16 * 1024 * 1024) -> "TcpFallback":
+    def client(cls, sock: socket.socket, *, cafile: str, server_hostname: str, certificate: str | None = None, private_key: str | None = None, max_frame_size: int = 16 * 1024 * 1024, timeout_seconds: float = 10.0) -> "TcpFallback":
         if not cafile or not server_hostname: raise ValueError("CA file and server hostname are required")
         context = ssl.create_default_context(cafile=cafile)
         context.minimum_version = ssl.TLSVersion.TLSv1_3
-        return cls(context.wrap_socket(sock, server_hostname=server_hostname), max_frame_size=max_frame_size)
+        context.set_alpn_protocols([ALPN])
+        if (certificate is None) != (private_key is None):
+            raise ValueError("client certificate and private key must be supplied together")
+        if certificate and private_key:
+            context.load_cert_chain(certificate, private_key)
+        wrapped = context.wrap_socket(sock, server_hostname=server_hostname)
+        if wrapped.selected_alpn_protocol() != ALPN:
+            wrapped.close(); raise ValueError("TCP fallback ALPN negotiation failed")
+        return cls(wrapped, max_frame_size=max_frame_size, timeout_seconds=timeout_seconds)
 
     @classmethod
-    def server(cls, sock: socket.socket, *, certificate: str, private_key: str, cafile: str | None = None, require_client_certificate: bool = False, max_frame_size: int = 16 * 1024 * 1024) -> "TcpFallback":
+    def server(cls, sock: socket.socket, *, certificate: str, private_key: str, cafile: str | None = None, require_client_certificate: bool = False, max_frame_size: int = 16 * 1024 * 1024, timeout_seconds: float = 10.0) -> "TcpFallback":
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_3
+        context.set_alpn_protocols([ALPN])
         context.load_cert_chain(certificate, private_key)
         if require_client_certificate:
             if not cafile: raise ValueError("cafile is required for mutual TLS")
             context.verify_mode = ssl.CERT_REQUIRED; context.load_verify_locations(cafile)
-        return cls(context.wrap_socket(sock, server_side=True), max_frame_size=max_frame_size)
+        wrapped = context.wrap_socket(sock, server_side=True)
+        if wrapped.selected_alpn_protocol() != ALPN:
+            wrapped.close(); raise ValueError("TCP fallback ALPN negotiation failed")
+        return cls(wrapped, max_frame_size=max_frame_size, timeout_seconds=timeout_seconds)
 
 
 def provision_dev_certificate(directory: str, hostname: str = "localhost") -> tuple[str, str]:

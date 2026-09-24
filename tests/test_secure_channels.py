@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import pytest
 
@@ -11,9 +12,9 @@ from pqc_a2a import (
 def test_session_handshake_hides_stable_ids_and_rejects_replay():
     a, b = AgentIdentity("agent-a-real"), AgentIdentity("agent-b-real")
     client, server = SessionInitiator(a, b, handle_epoch=7), SessionInitiator(b, a, handle_epoch=7)
-    hello = client.hello(issued_at=100)
+    hello = client.hello(issued_at=int(time.time()))
     assert "agent-a-real" not in str(hello) and "agent-b-real" not in str(hello)
-    ack = server.respond(hello, issued_at=101); client.accept_ack(ack)
+    ack = server.respond(hello, issued_at=int(time.time())); client.accept_ack(ack)
     record = client.encrypt({"task": "secret"}, padding_bucket=256)
     assert server.decrypt(record) == {"task": "secret"}
     with pytest.raises(ValueError, match="replayed"):
@@ -36,7 +37,7 @@ def test_opaque_relay_and_rendezvous_capability():
     rendezvous.register(handle, "https://private.invalid", register, identity, now=100)
     assert rendezvous.lookup(handle, register, identity, now=100)["handle"] == handle
     relay = OpaqueRelay(max_queue_per_handle=1)
-    record = {"format": "pqc-a2a-secure-record/1", "handle": handle, "session_id": "s", "sequence": 0}
+    record = {"format": "pqc-a2a-secure-record/2", "handle": handle, "session_id": "s", "sequence": 0}
     relay.forward(record); assert relay.receive(handle) == record
 
 

@@ -18,26 +18,27 @@ def make_discovery_record(card: AgentCard, identity: AgentIdentity, *, challenge
     return {**body, "signature": b64(_sign(identity, canonical(body)))}
 
 
-def verify_discovery_record(record: dict[str, Any], *, trusted_identity: AgentIdentity, replay: Any, now: int | None = None, clock_skew: int = 30) -> AgentCard:
+def verify_discovery_record(record: dict[str, Any], *, trusted_identity: AgentIdentity, replay: Any, expected_challenge: str, now: int | None = None, clock_skew: int = 30, max_ttl_seconds: int = 3600) -> AgentCard:
     if record.get("format") != "pqc-a2a-discovery/1": raise ValueError("unsupported discovery format")
-    if not isinstance(record.get("challenge"), str) or not record["challenge"]: raise ValueError("invalid discovery challenge")
-    if not isinstance(record.get("issued_at"), int) or not isinstance(record.get("expires_at"), int) or record["expires_at"] <= record["issued_at"]: raise ValueError("invalid discovery validity")
+    if not isinstance(expected_challenge, str) or not expected_challenge or record.get("challenge") != expected_challenge: raise ValueError("discovery challenge mismatch")
+    if not isinstance(record.get("challenge"), str) or not record["challenge"] or len(record["challenge"].encode()) > 256: raise ValueError("invalid discovery challenge")
+    if not isinstance(record.get("issued_at"), int) or isinstance(record["issued_at"], bool) or not isinstance(record.get("expires_at"), int) or isinstance(record["expires_at"], bool) or record["expires_at"] <= record["issued_at"] or record["expires_at"] - record["issued_at"] > max_ttl_seconds: raise ValueError("invalid discovery validity")
     now = int(time.time()) if now is None else int(now)
     if now < record["issued_at"] - clock_skew or now > record["expires_at"] + clock_skew: raise ValueError("discovery record expired")
     body = {k: record[k] for k in ("format", "challenge", "issued_at", "expires_at", "agent_card")}
     with oqs.Signature(trusted_identity.sig_name) as verifier:
         if not verifier.verify(canonical(body), unb64(record.get("signature", "")), trusted_identity.sig_public): raise ValueError("discovery signature verification failed")
-    if not replay.accept(record["challenge"]): raise ValueError("discovery replay detected")
+    if not replay.accept(record["challenge"], now=now): raise ValueError("discovery replay detected")
     return verify_agent_card(record["agent_card"], trusted_identity)
 
 
-def provision_trust_store_from_discovery(record: dict[str, Any], *, anchor: AgentIdentity, store: TrustStore, replay: Any, now: int | None = None) -> str:
+def provision_trust_store_from_discovery(record: dict[str, Any], *, anchor: AgentIdentity, store: TrustStore, replay: Any, expected_challenge: str, now: int | None = None) -> str:
     """Provision only after an already trusted anchor authenticates discovery.
 
     This is not PKI: callers must establish the anchor out of band and retain
     the store as protected configuration.
     """
-    card = verify_discovery_record(record, trusted_identity=anchor, replay=replay, now=now)
+    card = verify_discovery_record(record, trusted_identity=anchor, replay=replay, expected_challenge=expected_challenge, now=now)
     public = record["agent_card"]["card"]["issuerPublicKey"]
     if public["agent_id"] != card.agent_id: raise ValueError("discovery identity mismatch")
     with store._lock:

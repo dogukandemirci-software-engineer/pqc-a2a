@@ -44,5 +44,6 @@ def test_fragmentation_roundtrip_and_tamper():
 def test_transport_configuration():
     from pqc_a2a import TransportProfile, ALPN, TLS_VERSION
     p = TransportProfile(mtu=1200)
-    c = p.client_configuration()
-    assert c.alpn_protocols == [ALPN] and TLS_VERSION == 'TLSv1.3'
+    with pytest.raises(ValueError, match="cafile"):
+        p.client_configuration()
+    assert ALPN == 'pqc-a2a/1' and TLS_VERSION == 'TLSv1.3'

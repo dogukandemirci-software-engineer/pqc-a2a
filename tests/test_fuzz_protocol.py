@@ -3,7 +3,7 @@ import random
 
 import pytest
 
-from pqc_a2a import AgentIdentity, fragment, open_envelope, reassemble, seal
+from pqc_a2a import ReplayCache, AgentIdentity, fragment, open_envelope, reassemble, seal
 
 
 def test_fragment_reassemble_property_for_many_payload_shapes():
@@ -34,7 +34,7 @@ def test_envelope_mutation_fuzz_never_returns_plaintext():
         else:
             mutated[key] = None
         try:
-            result = open_envelope(receiver, sender, mutated)
+            result = open_envelope(receiver, sender, mutated, ReplayCache())
         except Exception:
             continue
         assert result != {"secret": "value"}

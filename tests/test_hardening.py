@@ -3,7 +3,7 @@ import socket
 import pytest
 
 from pqc_a2a import (
-    AgentCard, AgentIdentity, AuditLogger, DurableReplayCache, FileSecretProvider, Metrics,
+    AgentCard, AgentIdentity, AuditLogger, DurableReplayCache, FileSecretProvider, Metrics, ReplayCache,
     SkippedKeyStore, TcpFallback, TrustStore, make_discovery_record,
     new_challenge, open_envelope, provision_trust_store_from_discovery,
     provision_dev_certificate, seal, verify_discovery_record,
@@ -13,13 +13,13 @@ from pqc_a2a import (
 def test_discovery_is_signed_time_bound_and_replay_protected(tmp_path):
     identity = AgentIdentity("discovery-agent")
     cache = DurableReplayCache(tmp_path / "replay.db", ttl_seconds=60)
-    record = make_discovery_record(AgentCard(identity.agent_id), identity, challenge=new_challenge(), issued_at=1000)
-    assert verify_discovery_record(record, trusted_identity=identity, replay=cache, now=1001).agent_id == identity.agent_id
+    challenge = new_challenge(); record = make_discovery_record(AgentCard(identity.agent_id), identity, challenge=challenge)
+    assert verify_discovery_record(record, trusted_identity=identity, replay=cache, expected_challenge=challenge).agent_id == identity.agent_id
     with pytest.raises(ValueError, match="replay"):
-        verify_discovery_record(record, trusted_identity=identity, replay=cache, now=1001)
+        verify_discovery_record(record, trusted_identity=identity, replay=cache, expected_challenge=challenge)
     expired = make_discovery_record(AgentCard(identity.agent_id), identity, challenge=new_challenge(), issued_at=1000, ttl_seconds=5)
     with pytest.raises(ValueError, match="expired"):
-        verify_discovery_record(expired, trusted_identity=identity, replay=cache, now=1006, clock_skew=0)
+        verify_discovery_record(expired, trusted_identity=identity, replay=cache, expected_challenge=expired['challenge'], now=1006, clock_skew=0)
 
 
 def test_discovery_can_provision_only_from_anchor(tmp_path):
@@ -27,7 +27,7 @@ def test_discovery_can_provision_only_from_anchor(tmp_path):
     cache = DurableReplayCache(tmp_path / "replay.db")
     record = make_discovery_record(AgentCard(identity.agent_id), identity, challenge="one")
     store = TrustStore()
-    assert provision_trust_store_from_discovery(record, anchor=identity, store=store, replay=cache)
+    assert provision_trust_store_from_discovery(record, anchor=identity, store=store, replay=cache, expected_challenge="one")
     assert store.is_trusted(identity)
 
 
@@ -65,7 +65,7 @@ def test_certificate_san_and_envelope_observability(tmp_path):
     assert len(TransportProfile.validate_certificate_hostname(cert, "localhost")) == 64
     sender, receiver = AgentIdentity("obs-a"), AgentIdentity("obs-b")
     metrics = Metrics(); audit = AuditLogger()
-    assert open_envelope(receiver, sender, seal(sender, receiver, {"ok": 1}), metrics=metrics, audit=audit) == {"ok": 1}
+    assert open_envelope(receiver, sender, seal(sender, receiver, {"ok": 1}), ReplayCache(), metrics=metrics, audit=audit) == {"ok": 1}
     assert metrics.snapshot()["envelope.open.success"] == 1
 
 
@@ -75,4 +75,4 @@ def test_transport_and_envelope_fuzz_like_mutations_are_rejected():
     for field in ("nonce", "kem_ciphertext", "ephemeral_x25519", "signature"):
         mutated = dict(envelope); mutated[field] = "!"
         with pytest.raises((ValueError, Exception)):
-            open_envelope(receiver, sender, mutated)
+            open_envelope(receiver, sender, mutated, ReplayCache())

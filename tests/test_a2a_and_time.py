@@ -3,6 +3,7 @@ import pytest
 from pqc_a2a import (
     AgentCard,
     AgentIdentity,
+    ReplayCache,
     agent_card_document,
     make_jsonrpc_request,
     make_jsonrpc_result,
@@ -16,12 +17,12 @@ from pqc_a2a import (
 def test_message_validity_window_is_signed_and_enforced():
     sender, receiver = AgentIdentity("sender"), AgentIdentity("receiver")
     envelope = seal(sender, receiver, {"ok": True}, issued_at=1000, ttl_seconds=10)
-    assert open_envelope(receiver, sender, envelope, now=1005) == {"ok": True}
+    assert open_envelope(receiver, sender, envelope, ReplayCache(), now=1005) == {"ok": True}
     with pytest.raises(ValueError, match="expired"):
-        open_envelope(receiver, sender, envelope, now=1011, clock_skew=0)
+        open_envelope(receiver, sender, envelope, ReplayCache(), now=1011, clock_skew=0)
     envelope["expires_at"] = 9999
     with pytest.raises(ValueError):
-        open_envelope(receiver, sender, envelope, now=1005)
+        open_envelope(receiver, sender, envelope, ReplayCache(), now=1005)
 
 
 def test_agent_card_and_jsonrpc_adapter():
